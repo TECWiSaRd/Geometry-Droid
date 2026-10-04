@@ -95,6 +95,8 @@ const SEASON_TIER_REWARD = 1_000; // x tier number; scales with payouts
 const SEASON_PRIZES = [100_000, 50_000, 25_000]; // top 3 at season end; scale with payouts
 const SEASON_ROLE_ID = process.env.SEASON_ROLE_ID; // optional: moves to each season's #1
 const SEASON_RESETS_PRESTIGE = false; // true wipes everyone's XP and prestige at each season end
+const LOTW_REVIEW_CHANNEL_ID = process.env.LOTW_REVIEW_CHANNEL_ID; // optional: where clear proofs go for review
+const LOTW_REWARD_PER_STAR = 2_000; // per star of the featured level; scales with payouts
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -254,6 +256,7 @@ const ACHIEVEMENTS = [
   { key: 'champion', name: '🏆 Champion', desc: 'Win a trivia tournament', stat: 'tourney_wins', goal: 1, reward: 3_000 },
   { key: 'team_spirit', name: '🤝 Team Spirit', desc: 'Help complete 3 weekly challenges', stat: 'weekly_done', goal: 3, reward: 3_000 },
   { key: 'season_champ', name: '👑 Season Champion', desc: 'Finish a season in 1st place', stat: 'season_wins', goal: 1, reward: 10_000 },
+  { key: 'level_clearer', name: '🎮 Level Clearer', desc: 'Get 5 Level of the Week clears verified', stat: 'lotw', goal: 5, reward: 10_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
@@ -349,6 +352,15 @@ CREATE TABLE IF NOT EXISTS season_points (
   season INTEGER NOT NULL, user_id TEXT NOT NULL, pts INTEGER NOT NULL, tier INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (season, user_id)
 );
+CREATE TABLE IF NOT EXISTS lotw (
+  guild_id TEXT PRIMARY KEY, level_id TEXT NOT NULL, name TEXT NOT NULL, stars INTEGER NOT NULL, ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lotw_subs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, level_id TEXT NOT NULL, user_id TEXT NOT NULL, stars INTEGER NOT NULL,
+  proof TEXT NOT NULL, status TEXT NOT NULL, ts INTEGER NOT NULL, reviewer TEXT,
+  UNIQUE (guild_id, level_id, user_id)
+);
 `);
 
 const q = {
@@ -426,6 +438,17 @@ const q = {
   getPts: db.prepare('SELECT pts, tier FROM season_points WHERE season = ? AND user_id = ?'),
   seasonTop: db.prepare('SELECT user_id, pts FROM season_points WHERE season = ? ORDER BY pts DESC, user_id LIMIT 10'),
   seasonRank: db.prepare('SELECT COUNT(*) + 1 AS r FROM season_points WHERE season = ? AND pts > ?'),
+  getLotw: db.prepare('SELECT * FROM lotw WHERE guild_id = ?'),
+  setLotw: db.prepare('INSERT OR REPLACE INTO lotw (guild_id, level_id, name, stars, ts) VALUES (?, ?, ?, ?, ?)'),
+  delLotw: db.prepare('DELETE FROM lotw WHERE guild_id = ?'),
+  // A rejected clear can be resubmitted; pending or approved ones can't.
+  submitClear: db.prepare(`INSERT INTO lotw_subs (guild_id, level_id, user_id, stars, proof, status, ts) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    ON CONFLICT(guild_id, level_id, user_id) DO UPDATE SET proof = excluded.proof, stars = excluded.stars, status = 'pending', ts = excluded.ts, reviewer = NULL
+    WHERE lotw_subs.status = 'rejected' RETURNING id`),
+  getClear: db.prepare('SELECT status FROM lotw_subs WHERE guild_id = ? AND level_id = ? AND user_id = ?'),
+  reviewClear: db.prepare("UPDATE lotw_subs SET status = @status, reviewer = @reviewer WHERE id = @id AND status = 'pending' RETURNING *"),
+  clearCount: db.prepare("SELECT COUNT(*) AS n FROM lotw_subs WHERE guild_id = ? AND level_id = ? AND status = 'approved'"),
+  subById: db.prepare('SELECT * FROM lotw_subs WHERE id = ?'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -724,6 +747,25 @@ const commands = [
     .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10)),
   new SlashCommandBuilder().setName('weekly').setDescription("See this week's server-wide challenge"),
   new SlashCommandBuilder().setName('season').setDescription('Season standings and your season pass'),
+  new SlashCommandBuilder()
+    .setName('lotw')
+    .setDescription('Level of the Week: beat it and send proof for orbs')
+    .addSubcommand((s) => s.setName('info').setDescription('See the current Level of the Week'))
+    .addSubcommand((s) =>
+      s
+        .setName('submit')
+        .setDescription('Send proof that you beat it')
+        .addAttachmentOption((o) => o.setName('proof').setDescription('Screenshot or video of the clear').setRequired(true))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('set')
+        .setDescription('Feature a level (Manage Server)')
+        .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
+        .addStringOption((o) => o.setName('name').setDescription('Level name').setRequired(true))
+        .addIntegerOption((o) => o.setName('stars').setDescription('Star rating; sets the reward').setRequired(true).setMinValue(1).setMaxValue(10))
+    )
+    .addSubcommand((s) => s.setName('end').setDescription('Stop featuring the level (Manage Server)')),
   new SlashCommandBuilder()
     .setName('coins')
     .setDescription('See your Secret Coin collection')
@@ -1691,6 +1733,105 @@ async function handleSeason(i) {
   });
 }
 
+/* ───────────── Level of the Week ───────────── */
+
+const lotwReward = (stars) => Math.floor(LOTW_REWARD_PER_STAR * stars * payoutMultiplier());
+const isMod = (i) => i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+
+async function handleLotw(i) {
+  const sub = i.options.getSubcommand();
+  const level = q.getLotw.get(i.guildId);
+
+  if (sub === 'set') {
+    if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
+    const id = i.options.getString('level_id').trim();
+    if (!/^\d{1,12}$/.test(id)) return fail(i, 'Level IDs are numbers, like `128` or `91398357`.');
+    const name = i.options.getString('name').trim().slice(0, 64);
+    const stars = i.options.getInteger('stars');
+    q.setLotw.run(i.guildId, id, name, stars, nowSec());
+    return i.reply({
+      embeds: [embed(`**${name}** (ID \`${id}\`, ${stars}★) is the new Level of the Week!\nBeat it and send proof with \`/lotw submit\` for **${fmt(lotwReward(stars))}** ${ORB}.`, '🎮 Level of the Week')],
+    });
+  }
+
+  if (sub === 'end') {
+    if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
+    if (!level) return fail(i, 'There is no Level of the Week right now.');
+    q.delLotw.run(i.guildId);
+    return i.reply({ embeds: [embed(`**${level.name}** is no longer the Level of the Week. Pending proofs can still be reviewed.`, '🎮 Level of the Week')] });
+  }
+
+  if (!level) return fail(i, 'There is no Level of the Week right now. A moderator can set one with `/lotw set`.');
+
+  if (sub === 'info') {
+    const clears = q.clearCount.get(i.guildId, level.level_id).n;
+    const mine = q.getClear.get(i.guildId, level.level_id, i.user.id)?.status;
+    const you = { pending: 'Your proof is waiting for review.', approved: '✅ You have a verified clear.', rejected: 'Your last proof was rejected. You can submit again.' }[mine] ?? "You haven't submitted a clear yet.";
+    return i.reply({
+      embeds: [
+        embed(
+          `**${level.name}** · ID \`${level.level_id}\` · ${level.stars}★\n\nBeat it, then send a screenshot or video with \`/lotw submit\`. ` +
+            `A moderator checks it, and a verified clear pays **${fmt(lotwReward(level.stars))}** ${ORB}.\n\nVerified clears: **${clears}**\n${you}`,
+          '🎮 Level of the Week'
+        ),
+      ],
+    });
+  }
+
+  // submit
+  const proof = i.options.getAttachment('proof');
+  if (!/^(image|video)\//.test(proof.contentType ?? '')) return fail(i, 'Proof must be a screenshot or a video.');
+  const row = q.submitClear.get(i.guildId, level.level_id, i.user.id, level.stars, proof.url, nowSec());
+  if (!row) {
+    const status = q.getClear.get(i.guildId, level.level_id, i.user.id)?.status;
+    return fail(i, status === 'approved' ? 'Your clear of this level is already verified.' : 'Your proof is already waiting for review.');
+  }
+  await i.deferReply({ flags: EPH });
+
+  const review = LOTW_REVIEW_CHANNEL_ID ? await client.channels.fetch(LOTW_REVIEW_CHANNEL_ID).catch(() => null) : i.channel;
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`lotw:approve:${row.id}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`lotw:reject:${row.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
+  );
+  const e = embed(`${i.user} says they beat **${level.name}** (ID \`${level.level_id}\`, ${level.stars}★).\nReward if approved: **${fmt(lotwReward(level.stars))}** ${ORB}`, '🎮 Clear to review');
+  // Re-upload the proof so it doesn't vanish when Discord's attachment link expires; fall back to the link if it's too big.
+  const sent = await review
+    ?.send({ embeds: [e], components: [buttons], files: [{ attachment: proof.url, name: proof.name }] })
+    .catch(() => review.send({ embeds: [e.setDescription(`${e.data.description}\n\nProof: ${proof.url}`)], components: [buttons] }))
+    .catch(() => null);
+  if (!sent) {
+    q.reviewClear.run({ status: 'rejected', reviewer: null, id: row.id }); // frees the slot so they can try again
+    return fail(i, "I couldn't post your proof for review (check my permissions in the review channel). Try again later.");
+  }
+  return i.editReply({ content: '📨 Proof sent to the moderators. You will be paid when it is approved.' });
+}
+
+async function handleLotwButton(i) {
+  const [, action, id] = i.customId.split(':');
+  if (!isMod(i)) return i.reply({ content: '❌ Only moderators (Manage Server) can review clears.', flags: EPH });
+  const pending = q.subById.get(Number(id));
+  if (!pending) return i.reply({ content: '❌ That submission no longer exists.', flags: EPH });
+  if (pending.user_id === i.user.id) return i.reply({ content: "❌ You can't review your own clear.", flags: EPH });
+
+  const row = q.reviewClear.get({ status: action === 'approve' ? 'approved' : 'rejected', reviewer: i.user.id, id: Number(id) });
+  if (!row) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
+
+  if (action !== 'approve') {
+    return i.update({
+      content: `<@${row.user_id}>, your clear was not accepted. You can submit new proof with \`/lotw submit\`.`,
+      embeds: [embed(`Rejected by ${i.user}.`, '🎮 Clear rejected')],
+      components: [],
+    });
+  }
+  const granted = mintTx(row.user_id, lotwReward(row.stars));
+  const notes = afterEarn(row.user_id, row.guild_id, ['lotw'], granted);
+  return i.update({
+    content: `<@${row.user_id}>, your clear was verified!`,
+    embeds: [embed(withNotes(`Approved by ${i.user}. <@${row.user_id}> earned **${fmt(granted)}** ${ORB}.`, notes), '🎮 Clear verified')],
+    components: [],
+  });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1809,7 +1950,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
-    const handler = { drop: handleDropButton, tn: handleTournamentButton }[i.customId.split(':')[0]] ?? handleChallengeButton;
+    const handler = { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton }[i.customId.split(':')[0]] ?? handleChallengeButton;
     return handler(i).catch(console.error);
   }
   if (!i.isChatInputCommand()) return;
@@ -1884,6 +2025,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleWeekly(i);
       case 'season':
         return await handleSeason(i);
+      case 'lotw':
+        return await handleLotw(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
