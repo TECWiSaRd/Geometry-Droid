@@ -77,6 +77,16 @@ const TOURNEY_ROUND_SECONDS = 15;
 const TOURNEY_MIN_PLAYERS = 3;
 const TOURNEY_POOL = 30_000; // split between the top 3; scales with payouts
 const TOURNEY_SPLIT = [0.5, 0.3, 0.2];
+// Weekly server goals rotate each Monday (UTC). Target = per x active players (min 5).
+const WEEKLY_GOALS = [
+  { stat: 'mine', text: 'Mine', per: 4 },
+  { stat: 'quiz', text: 'Answer quizzes correctly', per: 5 },
+  { stat: 'fish', text: 'Fish', per: 6 },
+  { stat: 'daily', text: 'Claim /daily', per: 3 },
+  { stat: 'build', text: 'Build', per: 4 },
+  { stat: 'earns', text: 'Get paid from earn commands', per: 20 },
+];
+const WEEKLY_REWARD = 5_000; // to every contributor when the goal is met; scales with payouts
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -234,6 +244,7 @@ const ACHIEVEMENTS = [
   { key: 'founder', name: '🏰 Founder', desc: 'Found a clan', stat: 'clan_founded', goal: 1, reward: 1_000 },
   { key: 'demon_slayer', name: '🗡️ Demon Slayer', desc: 'Help defeat 3 raid bosses', stat: 'raids_won', goal: 3, reward: 5_000 },
   { key: 'champion', name: '🏆 Champion', desc: 'Win a trivia tournament', stat: 'tourney_wins', goal: 1, reward: 3_000 },
+  { key: 'team_spirit', name: '🤝 Team Spirit', desc: 'Help complete 3 weekly challenges', stat: 'weekly_done', goal: 3, reward: 3_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
@@ -316,6 +327,15 @@ CREATE TABLE IF NOT EXISTS coins (
   user_id TEXT NOT NULL, coin TEXT NOT NULL, ts INTEGER NOT NULL,
   PRIMARY KEY (user_id, coin)
 );
+CREATE TABLE IF NOT EXISTS weekly (
+  guild_id TEXT NOT NULL, week INTEGER NOT NULL, goal TEXT NOT NULL, target INTEGER NOT NULL,
+  progress INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, week)
+);
+CREATE TABLE IF NOT EXISTS weekly_contrib (
+  guild_id TEXT NOT NULL, week INTEGER NOT NULL, user_id TEXT NOT NULL, n INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, week, user_id)
+);
 `);
 
 const q = {
@@ -380,6 +400,14 @@ const q = {
   delRaidDamage: db.prepare('DELETE FROM raid_damage WHERE guild_id = ?'),
   userCoins: db.prepare('SELECT coin FROM coins WHERE user_id = ?'),
   addCoin: db.prepare('INSERT OR IGNORE INTO coins (user_id, coin, ts) VALUES (?, ?, ?)'),
+  newWeekly: db.prepare('INSERT OR IGNORE INTO weekly (guild_id, week, goal, target) VALUES (?, ?, ?, ?)'),
+  getWeekly: db.prepare('SELECT * FROM weekly WHERE guild_id = ? AND week = ?'),
+  bumpWeekly: db.prepare('UPDATE weekly SET progress = progress + 1 WHERE guild_id = ? AND week = ? AND done = 0 RETURNING progress, target'),
+  finishWeekly: db.prepare('UPDATE weekly SET done = 1 WHERE guild_id = ? AND week = ? AND done = 0 AND progress >= target'),
+  addContrib: db.prepare('INSERT INTO weekly_contrib (guild_id, week, user_id, n) VALUES (?, ?, ?, 1) ON CONFLICT(guild_id, week, user_id) DO UPDATE SET n = n + 1'),
+  getContrib: db.prepare('SELECT n FROM weekly_contrib WHERE guild_id = ? AND week = ? AND user_id = ?'),
+  contribs: db.prepare('SELECT user_id, n FROM weekly_contrib WHERE guild_id = ? AND week = ? ORDER BY n DESC'),
+  activePlayers: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM cooldowns WHERE ts > ?'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -676,6 +704,7 @@ const commands = [
     .setDescription('Start a trivia tournament in this channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10)),
+  new SlashCommandBuilder().setName('weekly').setDescription("See this week's server-wide challenge"),
   new SlashCommandBuilder()
     .setName('coins')
     .setDescription('See your Secret Coin collection')
@@ -1497,6 +1526,68 @@ async function handleTournamentButton(i) {
   return i.reply({ content: '🔒 Answer locked in.', flags: EPH });
 }
 
+/* ───────────── Weekly challenges ───────────── */
+
+// Weeks start Monday 00:00 UTC (the Unix epoch was a Thursday, hence the +3 days).
+const weekIndex = () => Math.floor((nowSec() / DAY_SECONDS + 3) / 7);
+const weekEnd = (week) => ((week + 1) * 7 - 3) * DAY_SECONDS;
+
+// The week's goal is created on first use, sized to how many players were active last week.
+function currentWeekly(guildId) {
+  const week = weekIndex();
+  const goal = WEEKLY_GOALS[week % WEEKLY_GOALS.length];
+  const active = q.activePlayers.get(nowSec() - 7 * DAY_SECONDS).n;
+  q.newWeekly.run(guildId, week, goal.stat, goal.per * Math.max(5, active));
+  return q.getWeekly.get(guildId, week);
+}
+
+const weeklyGoalText = (w) => `${WEEKLY_GOALS.find((g) => g.stat === w.goal)?.text ?? w.goal} **${fmt(w.target)}** times as a server`;
+
+async function announce(text, title) {
+  if (!EVENT_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(EVENT_CHANNEL_ID).catch(() => null);
+  await channel?.send({ embeds: [embed(text, title)] }).catch(() => {});
+}
+
+earnHooks.push(({ uid, guildId, events, notes }) => {
+  if (!guildId) return;
+  const w = currentWeekly(guildId);
+  if (w.done || !events.includes(w.goal)) return;
+  q.addContrib.run(guildId, w.week, uid);
+  const row = q.bumpWeekly.get(guildId, w.week);
+  if (!row || row.progress < row.target) return;
+  if (q.finishWeekly.run(guildId, w.week).changes === 0) return; // someone else already finished it
+
+  const helpers = q.contribs.all(guildId, w.week);
+  const each = Math.floor(WEEKLY_REWARD * payoutMultiplier());
+  payoutTx(helpers.map((c) => [c.user_id, each]));
+  const unlocks = [];
+  for (const c of helpers) {
+    const own = c.user_id === uid ? notes : [];
+    bumpStat(c.user_id, 'weekly_done', 1, own);
+    if (c.user_id !== uid) for (const n of own) unlocks.push(`<@${c.user_id}> ${n}`);
+  }
+  notes.push(`🏁 Weekly challenge complete! All **${helpers.length}** helpers get **${fmt(each)}** ${ORB}.`);
+  announce(withNotes(`${weeklyGoalText(w)}: done! All **${helpers.length}** players who helped get **${fmt(each)}** ${ORB}.`, unlocks), '🏁 Weekly challenge complete').catch(() => {});
+});
+
+async function handleWeekly(i) {
+  const w = currentWeekly(i.guildId);
+  const mine = q.getContrib.get(i.guildId, w.week, i.user.id)?.n ?? 0;
+  const status = w.done
+    ? '✅ Done! Everyone who helped was paid.'
+    : `${hpBar(Math.min(w.progress, w.target), w.target)}\nProgress: **${fmt(w.progress)}** / ${fmt(w.target)}`;
+  return i.reply({
+    embeds: [
+      embed(
+        `${weeklyGoalText(w)}.\n\n${status}\n\nYour contribution: **${fmt(mine)}**\n` +
+          `Reward: **${fmt(Math.floor(WEEKLY_REWARD * payoutMultiplier()))}** ${ORB} to everyone who helped. Ends <t:${weekEnd(w.week)}:R>.`,
+        '📆 Weekly challenge'
+      ),
+    ],
+  });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1686,6 +1777,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleCoins(i);
       case 'tournament':
         return await handleTournament(i);
+      case 'weekly':
+        return await handleWeekly(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
