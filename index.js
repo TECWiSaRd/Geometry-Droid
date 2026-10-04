@@ -57,6 +57,15 @@ const CLAN_MAX_LEVEL = 5;
 const CLAN_BONUS = 0.01; // +1% earn payouts per clan level, for every member
 const CLAN_UPGRADE_BASE = 50_000; // level L -> L+1 costs this x 3^L; scales like shop prices
 const CLAN_INVITE_DAYS = 7;
+const EVENT_CHANNEL_ID = process.env.EVENT_CHANNEL_ID || DROP_CHANNEL_ID; // raids and event announcements
+const RAID_HOURS = 48; // time to defeat the boss
+const RAID_GAP_HOURS = 72; // quiet time after a raid ends before the next one spawns
+const RAID_HP_PER_MEMBER = 300;
+const RAID_MIN_HP = 3_000;
+const RAID_POOL = 50_000; // shared reward, split by damage; scales with payouts
+const RAID_DAMAGE = { work: 10, build: 15, fish: 8, mine: 20, quiz: 20, daily: 25, drop: 15 };
+const RAID_CRIT = 0.1; // chance of a double-damage hit
+const RAID_BOSSES = ['😈 Demon Guardian', '🔥 Lava Pit Demon', '🗝️ Vault Keeper', '💀 Nine Circles Wraith'];
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -212,6 +221,7 @@ const ACHIEVEMENTS = [
   { key: 'quick_hands', name: '⚡ Quick Hands', desc: 'Win 5 orb drops', stat: 'drop', goal: 5, reward: 2_500 },
   { key: 'dedicated', name: '📅 Dedicated', desc: 'Reach a 30-day /daily streak', stat: 'daily_streak', goal: 30, reward: 10_000 },
   { key: 'founder', name: '🏰 Founder', desc: 'Found a clan', stat: 'clan_founded', goal: 1, reward: 1_000 },
+  { key: 'demon_slayer', name: '🗡️ Demon Slayer', desc: 'Help defeat 3 raid bosses', stat: 'raids_won', goal: 3, reward: 5_000 },
 ];
 
 /* ───────────── Database ───────────── */
@@ -280,6 +290,14 @@ CREATE TABLE IF NOT EXISTS clan_invites (
   clan_id INTEGER NOT NULL, user_id TEXT NOT NULL, ts INTEGER NOT NULL,
   PRIMARY KEY (clan_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS raids (
+  guild_id TEXT PRIMARY KEY, boss TEXT NOT NULL, hp INTEGER NOT NULL, max_hp INTEGER NOT NULL,
+  ends INTEGER NOT NULL, channel_id TEXT NOT NULL, message_id TEXT
+);
+CREATE TABLE IF NOT EXISTS raid_damage (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, dmg INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+);
 `);
 
 const q = {
@@ -334,6 +352,14 @@ const q = {
   memberDeposit: db.prepare('UPDATE clan_members SET contributed = contributed + ? WHERE user_id = ?'),
   clanLevelUp: db.prepare('UPDATE clans SET treasury = treasury - @cost, level = level + 1 WHERE id = @id AND treasury >= @cost AND level < @max'),
   topClans: db.prepare('SELECT * FROM clans WHERE guild_id = ? ORDER BY level DESC, contributed DESC LIMIT 10'),
+  getRaid: db.prepare('SELECT * FROM raids WHERE guild_id = ?'),
+  newRaid: db.prepare('INSERT INTO raids (guild_id, boss, hp, max_hp, ends, channel_id) VALUES (?, ?, ?, ?, ?, ?)'),
+  setRaidMsg: db.prepare('UPDATE raids SET message_id = ? WHERE guild_id = ?'),
+  hitRaid: db.prepare('UPDATE raids SET hp = MAX(0, hp - @dmg) WHERE guild_id = @guild AND hp > 0 AND ends > @now RETURNING hp'),
+  addDamage: db.prepare('INSERT INTO raid_damage (guild_id, user_id, dmg) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET dmg = dmg + excluded.dmg'),
+  raidDamage: db.prepare('SELECT user_id, dmg FROM raid_damage WHERE guild_id = ? ORDER BY dmg DESC'),
+  delRaid: db.prepare('DELETE FROM raids WHERE guild_id = ?'),
+  delRaidDamage: db.prepare('DELETE FROM raid_damage WHERE guild_id = ?'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -448,17 +474,31 @@ const depositTx = db.transaction((uid, clanId, amount) => {
   return true;
 });
 
+// Returns a Map of what each player was actually paid.
 const payoutTx = db.transaction((payouts) => {
   const total = payouts.reduce((n, [, a]) => n + a, 0);
   const avail = mintable();
   const ratio = total > avail ? avail / total : 1; // share what's left if the vault is short
+  const paid = new Map();
   for (const [uid, amount] of payouts) {
     const amt = Math.floor(amount * ratio);
     if (amt <= 0) continue;
     q.ensure.run(uid);
     q.add.run(amt, amt, uid);
     q.addXp.run(uid, amt);
+    paid.set(uid, amt);
   }
+  return paid;
+});
+
+// Removes the raid and its damage table in one step, so a boss can only be settled once.
+const closeRaidTx = db.transaction((guildId) => {
+  const raid = q.getRaid.get(guildId);
+  if (!raid) return null;
+  const dealers = q.raidDamage.all(guildId);
+  q.delRaid.run(guildId);
+  q.delRaidDamage.run(guildId);
+  return { raid, dealers };
 });
 
 /* ───────────── Helpers ───────────── */
@@ -605,6 +645,11 @@ const commands = [
       s.setName('info').setDescription('See a clan').addStringOption((o) => o.setName('name').setDescription('Clan name (default: yours)'))
     )
     .addSubcommand((s) => s.setName('top').setDescription('Top clans')),
+  new SlashCommandBuilder()
+    .setName('raid')
+    .setDescription('Fight the raid boss together')
+    .addSubcommand((s) => s.setName('status').setDescription('Boss HP and top hitters'))
+    .addSubcommand((s) => s.setName('start').setDescription('Summon a boss in this channel now (Manage Server)')),
   new SlashCommandBuilder()
     .setName('achievements')
     .setDescription('See unlocked achievements and progress')
@@ -1136,6 +1181,138 @@ async function handleClan(i) {
   return i.reply({ embeds: [embed(text, '🏆 Top clans')] });
 }
 
+/* ───────────── Raids ───────────── */
+
+const raidDirty = new Set(); // guilds whose raid message needs an HP refresh
+const hpBar = (hp, max) => {
+  const full = Math.round((hp / max) * 20);
+  return `${'█'.repeat(full)}${'░'.repeat(20 - full)}`;
+};
+
+const raidEmbed = (raid) =>
+  embed(
+    `${hpBar(raid.hp, raid.max_hp)}\nHP: **${fmt(raid.hp)}** / ${fmt(raid.max_hp)}\n\n` +
+      `Every earn command, \`/daily\` and drop win hits the boss. Defeat it <t:${raid.ends}:R> to split ` +
+      `**${fmt(Math.floor(RAID_POOL * payoutMultiplier()))}** ${ORB} by damage dealt. \`/raid status\` shows the top hitters.`,
+    `⚔️ Raid: ${raid.boss}`
+  );
+
+async function startRaid(guild, channel) {
+  const maxHp = Math.max(RAID_MIN_HP, guild.memberCount * RAID_HP_PER_MEMBER);
+  const ends = nowSec() + RAID_HOURS * 3600;
+  q.newRaid.run(guild.id, pick(RAID_BOSSES), maxHp, maxHp, ends, channel.id);
+  const raid = q.getRaid.get(guild.id);
+  const msg = await channel.send({ embeds: [raidEmbed(raid)] });
+  q.setRaidMsg.run(msg.id, guild.id);
+  return raid;
+}
+
+async function raidMessage(raid) {
+  if (!raid.message_id) return null;
+  const channel = await client.channels.fetch(raid.channel_id).catch(() => null);
+  return channel?.messages.fetch(raid.message_id).catch(() => null) ?? null;
+}
+
+async function finishRaid(guildId, won) {
+  const closed = closeRaidTx(guildId);
+  if (!closed) return;
+  const { raid, dealers } = closed;
+  raidDirty.delete(guildId);
+  q.setMeta.run(`raid_next:${guildId}`, String(nowSec() + RAID_GAP_HOURS * 3600));
+
+  let text;
+  if (won && dealers.length) {
+    const total = dealers.reduce((n, d) => n + d.dmg, 0);
+    const pool = Math.floor(RAID_POOL * payoutMultiplier());
+    const paid = payoutTx(dealers.map((d) => [d.user_id, Math.floor((pool * d.dmg) / total)]));
+    const unlocks = [];
+    for (const d of dealers) {
+      const notes = [];
+      bumpStat(d.user_id, 'raids_won', 1, notes);
+      for (const n of notes) unlocks.push(`<@${d.user_id}> ${n}`);
+    }
+    const top = dealers
+      .slice(0, 10)
+      .map((d, n) => `**${n + 1}.** <@${d.user_id}> — ${fmt(d.dmg)} dmg, **${fmt(paid.get(d.user_id) ?? 0)}** ${ORB}`)
+      .join('\n');
+    const rest = dealers.length > 10 ? `\n…and ${dealers.length - 10} more raiders were paid.` : '';
+    text = withNotes(`**${raid.boss}** has fallen! The reward was split between **${dealers.length}** raiders:\n\n${top}${rest}`, unlocks);
+  } else {
+    text = `**${raid.boss}** escaped. Nobody gets the reward this time.`;
+  }
+
+  const msg = await raidMessage(raid);
+  if (msg) await msg.edit({ embeds: [embed(text, won ? '🏆 Raid won' : '💨 Raid failed')] }).catch(() => {});
+  const channel = await client.channels.fetch(raid.channel_id).catch(() => null);
+  if (channel && won) await channel.send({ embeds: [embed(`**${raid.boss}** was defeated. See the results above.`, '🏆 Raid won')] }).catch(() => {});
+  if (channel && !won) await channel.send({ embeds: [embed(text, '💨 Raid failed')] }).catch(() => {});
+}
+
+// Play deals damage to the live raid boss in that server.
+earnHooks.push(({ uid, guildId, events, notes }) => {
+  const source = events.find((e) => RAID_DAMAGE[e]);
+  if (!source || !guildId) return;
+  const crit = Math.random() < RAID_CRIT;
+  const dmg = RAID_DAMAGE[source] * (crit ? 2 : 1);
+  const row = q.hitRaid.get({ dmg, guild: guildId, now: nowSec() });
+  if (!row) return; // no live raid
+  q.addDamage.run(guildId, uid, dmg);
+  bumpStat(uid, 'raid_dmg', dmg, notes);
+  raidDirty.add(guildId);
+  notes.push(`⚔️ You hit the raid boss for **${dmg}**${crit ? ' (critical!)' : ''}. HP left: **${fmt(row.hp)}**`);
+  if (row.hp === 0) finishRaid(guildId, true).catch(console.error);
+});
+
+async function raidTick() {
+  const now = nowSec();
+  for (const guild of client.guilds.cache.values()) {
+    const raid = q.getRaid.get(guild.id);
+    if (raid) {
+      if (raid.ends <= now || raid.hp === 0) await finishRaid(guild.id, raid.hp === 0);
+      else if (raidDirty.delete(guild.id)) {
+        const msg = await raidMessage(raid);
+        if (msg) await msg.edit({ embeds: [raidEmbed(raid)] }).catch(() => {});
+      }
+      continue;
+    }
+    if (!EVENT_CHANNEL_ID) continue;
+    const key = `raid_next:${guild.id}`;
+    const next = Number(q.getMeta.get(key)?.value ?? 0);
+    if (!next) {
+      q.setMeta.run(key, String(now + 3600)); // first raid an hour after the bot starts
+      continue;
+    }
+    if (now < next) continue;
+    const channel = await client.channels.fetch(EVENT_CHANNEL_ID).catch(() => null);
+    if (channel?.guildId === guild.id) await startRaid(guild, channel);
+  }
+}
+
+async function handleRaid(i) {
+  const sub = i.options.getSubcommand();
+  const raid = q.getRaid.get(i.guildId);
+
+  if (sub === 'start') {
+    if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return fail(i, 'You need Manage Server for that.');
+    if (raid) return fail(i, `**${raid.boss}** is already rampaging.`);
+    await i.reply({ content: 'Summoning a raid boss…', flags: EPH });
+    await startRaid(i.guild, i.channel);
+    return;
+  }
+
+  if (!raid) {
+    const next = Number(q.getMeta.get(`raid_next:${i.guildId}`)?.value ?? 0);
+    const when = EVENT_CHANNEL_ID && next ? ` The next boss appears <t:${next}:R>.` : '';
+    return i.reply({ embeds: [embed(`No raid right now.${when}`, '⚔️ Raid')] });
+  }
+  const dealers = q.raidDamage.all(i.guildId);
+  const top = dealers.slice(0, 5).map((d, n) => `**${n + 1}.** <@${d.user_id}> — ${fmt(d.dmg)} dmg`).join('\n') || 'Nobody has attacked yet.';
+  const mine = dealers.find((d) => d.user_id === i.user.id)?.dmg ?? 0;
+  const e = raidEmbed(raid);
+  e.setDescription(`${e.data.description}\n\n**Top hitters**\n${top}\n\nYour damage: **${fmt(mine)}**`);
+  return i.reply({ embeds: [e] });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1319,6 +1496,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleAchievements(i);
       case 'clan':
         return await handleClan(i);
+      case 'raid':
+        return await handleRaid(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
@@ -1381,6 +1560,7 @@ client.once(Events.ClientReady, async (c) => {
   }
   setInterval(() => salaryTick().catch(console.error), 60 * 1000);
   setInterval(() => dropTick().catch(console.error), 60 * 1000);
+  setInterval(() => raidTick().catch(console.error), 60 * 1000);
 });
 
 client.login(TOKEN);
