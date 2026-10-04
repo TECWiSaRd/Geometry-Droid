@@ -2788,6 +2788,23 @@ client.on(Events.ShardReconnecting, (id) => console.warn(`[discord] shard ${id} 
 // Log stray errors instead of crashing; a crash-restart loop can use up Discord's daily logins.
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+client.rest.on('rateLimited', (info) => console.warn('[discord] rate limited:', JSON.stringify(info)));
+
+// Asks Discord directly whether this host can reach it, outside discord.js (which waits silently
+// on bans and rate limits). Prints the status, any retry-after, and the daily login (session) limit.
+async function checkDiscordReachable() {
+  try {
+    const res = await fetch('https://discord.com/api/v10/gateway/bot', {
+      headers: { Authorization: `Bot ${TOKEN}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = (await res.text()).replace(/\s+/g, ' ').slice(0, 400);
+    const retry = res.headers.get('retry-after');
+    console.log(`[discord] reachability check: HTTP ${res.status}${retry ? `, retry after ${retry}s` : ''}: ${body}`);
+  } catch (err) {
+    console.error('[discord] reachability check: could not reach discord.com:', err.message);
+  }
+}
 
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
@@ -2955,6 +2972,10 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(() => stockTick().catch(console.error), STOCK_POLL_MINUTES * 60 * 1000);
 });
 
+checkDiscordReachable();
+setTimeout(() => {
+  if (!client.isReady()) console.warn('[discord] still not connected after 60s. See the reachability check above.');
+}, 60_000).unref();
 console.log('Logging in to Discord…');
 client
   .login(TOKEN)
