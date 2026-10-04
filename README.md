@@ -21,6 +21,7 @@ Geometry Dash themed Discord economy bot.
 - `/lotw info|submit|set|end`: Level of the Week. A moderator (Manage Server) features a level with `/lotw set level_id name stars`. Players beat it and send a screenshot or video with `/lotw submit`; the bot re-uploads it to `LOTW_REVIEW_CHANNEL_ID` (or the current channel) with Approve/Reject buttons for moderators. You cannot review your own clear, and rejected players can resubmit. A verified clear pays 2,000 per star (scales with payouts)
 - `/level`, `/prestige`: earn XP from your payouts. Reach level 50 to prestige, which resets XP for +2% payouts per prestige (max 10)
 - `/shop`, `/buy item`: Image Permissions (1,000), Admin Permissions (1 trillion), Salary Raise (20,000, +5% salary), Good Resumé (500,000, +25% salary), Diamond Pickaxe (5,000, +2-10% mining), Good Fishing Rod (4,000, +2-15% fishing)
+- `/buy item amount`, `/use item`, `/inventory`: consumables you stack (up to 20 each) and use later. Speed Potion (3,000): halves all earn cooldowns for 30 min, 2 per UTC day. Chamber of Time Hourglass (800): resets all earn cooldowns, 3 per UTC day. Unlike other shop items, their prices scale with payouts so they never become a free money loop. `/inventory` also shows active effects and tool levels
 - `/salary set|remove|list` (Manage Server): automatic role payments
 
 ## Discord setup

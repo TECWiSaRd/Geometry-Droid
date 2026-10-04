@@ -149,7 +149,22 @@ const SHOP = {
     price: 4_000,
     perk: { action: 'fish', min: 2, max: 15, step: 5 },
   },
+  // Consumables stack in your inventory and are used with /use. Their prices scale with payouts
+  // (not slowly like the items above), so they stay worth about the same as the orbs they earn back.
+  speed_potion: {
+    name: '🧪 Speed Potion',
+    desc: 'Use it to halve all your earn cooldowns for 30 minutes. Up to 2 per day.',
+    price: 3_000,
+    consumable: { kind: 'speed', minutes: 30, daily: 2 },
+  },
+  hourglass: {
+    name: '⏳ Chamber of Time Hourglass',
+    desc: 'Use it to reset all your earn cooldowns at once. Up to 3 per day.',
+    price: 800,
+    consumable: { kind: 'reset', daily: 3 },
+  },
 };
+const MAX_STACK = 20; // most of one consumable a player can hold
 
 const ACTIONS = {
   work: {
@@ -361,6 +376,18 @@ CREATE TABLE IF NOT EXISTS lotw_subs (
   proof TEXT NOT NULL, status TEXT NOT NULL, ts INTEGER NOT NULL, reviewer TEXT,
   UNIQUE (guild_id, level_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS inventory (
+  user_id TEXT NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL CHECK (qty >= 0),
+  PRIMARY KEY (user_id, item)
+);
+CREATE TABLE IF NOT EXISTS buffs (
+  user_id TEXT NOT NULL, buff TEXT NOT NULL, until INTEGER NOT NULL,
+  PRIMARY KEY (user_id, buff)
+);
+CREATE TABLE IF NOT EXISTS item_uses (
+  user_id TEXT NOT NULL, item TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
+  PRIMARY KEY (user_id, item, day)
+);
 `);
 
 const q = {
@@ -449,6 +476,14 @@ const q = {
   reviewClear: db.prepare("UPDATE lotw_subs SET status = @status, reviewer = @reviewer WHERE id = @id AND status = 'pending' RETURNING *"),
   clearCount: db.prepare("SELECT COUNT(*) AS n FROM lotw_subs WHERE guild_id = ? AND level_id = ? AND status = 'approved'"),
   subById: db.prepare('SELECT * FROM lotw_subs WHERE id = ?'),
+  getQty: db.prepare('SELECT qty FROM inventory WHERE user_id = ? AND item = ?'),
+  addQty: db.prepare('INSERT INTO inventory (user_id, item, qty) VALUES (?, ?, ?) ON CONFLICT(user_id, item) DO UPDATE SET qty = qty + excluded.qty'),
+  takeQty: db.prepare('UPDATE inventory SET qty = qty - 1 WHERE user_id = ? AND item = ? AND qty > 0'),
+  inventory: db.prepare('SELECT item, qty FROM inventory WHERE user_id = ? AND qty > 0'),
+  getBuff: db.prepare('SELECT until FROM buffs WHERE user_id = ? AND buff = ?'),
+  setBuff: db.prepare('INSERT OR REPLACE INTO buffs (user_id, buff, until) VALUES (?, ?, ?)'),
+  getUses: db.prepare('SELECT n FROM item_uses WHERE user_id = ? AND item = ? AND day = ?'),
+  addUse: db.prepare('INSERT INTO item_uses (user_id, item, day, n) VALUES (?, ?, ?, 1) ON CONFLICT(user_id, item, day) DO UPDATE SET n = n + 1'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -467,7 +502,7 @@ const mintable = () => Math.max(0, supplyCap() - circulating());
 const payoutMultiplier = () => (SCALE_PAYOUTS ? Math.max(1, supplyCap() / START_SUPPLY) : 1);
 // Prices rise only slowly with the cap, unlike payouts which scale linearly.
 const priceMult = () => 1 + PRICE_SCALE * Math.log2(Math.max(1, supplyCap() / START_SUPPLY));
-const priceOf = (key) => Math.ceil(SHOP[key].price * priceMult());
+const priceOf = (key) => Math.ceil(SHOP[key].price * (SHOP[key].consumable ? payoutMultiplier() : priceMult()));
 
 // Orbs can only be minted while circulation is below the cap. Returns what was actually granted.
 const mintTx = db.transaction((uid, amount) => {
@@ -502,6 +537,24 @@ const upgradeTx = db.transaction((uid, key, cost, level) => {
   if (getBalance(uid) < cost) return 'poor';
   q.sub.run(cost, uid);
   q.setTool.run(uid, key, level + 1);
+  return 'ok';
+});
+
+const buyStackTx = db.transaction((uid, key, total, amount) => {
+  if ((q.getQty.get(uid, key)?.qty ?? 0) + amount > MAX_STACK) return 'full';
+  q.ensure.run(uid);
+  if (getBalance(uid) < total) return 'poor';
+  q.sub.run(total, uid);
+  q.addQty.run(uid, key, amount);
+  return 'ok';
+});
+
+// Takes one from the inventory if the player has one and hasn't hit today's limit.
+const useItemTx = db.transaction((uid, key, day, daily) => {
+  if ((q.getQty.get(uid, key)?.qty ?? 0) < 1) return 'none';
+  if ((q.getUses.get(uid, key, day)?.n ?? 0) >= daily) return 'limit';
+  q.takeQty.run(uid, key);
+  q.addUse.run(uid, key, day);
   return 'ok';
 });
 
@@ -707,7 +760,19 @@ const commands = [
         .setDescription('What to buy')
         .setRequired(true)
         .addChoices(...Object.entries(SHOP).map(([value, s]) => ({ name: s.name, value })))
+    )
+    .addIntegerOption((o) => o.setName('amount').setDescription('How many (potions and other consumables only)').setMinValue(1).setMaxValue(MAX_STACK)),
+  new SlashCommandBuilder()
+    .setName('use')
+    .setDescription('Use a potion or other consumable')
+    .addStringOption((o) =>
+      o
+        .setName('item')
+        .setDescription('What to use')
+        .setRequired(true)
+        .addChoices(...Object.entries(SHOP).filter(([, s]) => s.consumable).map(([value, s]) => ({ name: s.name, value })))
     ),
+  new SlashCommandBuilder().setName('inventory').setDescription('Your potions, active effects and tools'),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Richest players'),
   new SlashCommandBuilder().setName('daily').setDescription('Claim your daily orbs. Keep a streak for bigger rewards'),
   new SlashCommandBuilder()
@@ -1037,7 +1102,7 @@ async function handleEarn(i, name) {
   if ([...pending.values()].some((p) => p.userId === uid)) return fail(i, 'Finish your current bot check first.');
 
   const last = q.getCd.get(uid, name)?.ts ?? 0;
-  const readyAt = last + a.cooldown;
+  const readyAt = last + Math.ceil(a.cooldown * cooldownMult(uid, now));
   if (now < readyAt) return fail(i, `${a.emoji} You can /${name} again <t:${readyAt}:R>.`);
 
   let amount = Math.floor(rand(a.min, a.max) * payoutMultiplier());
@@ -1075,6 +1140,16 @@ async function handleBuy(i) {
   const key = i.options.getString('item');
   const item = { ...SHOP[key], price: priceOf(key) };
   const uid = i.user.id;
+  if (item.consumable) {
+    const amount = i.options.getInteger('amount') ?? 1;
+    const total = item.price * amount;
+    const result = buyStackTx(uid, key, total, amount);
+    if (result === 'full') return fail(i, `You can hold up to **${MAX_STACK}** of ${item.name}.`);
+    if (result === 'poor') return fail(i, `${amount} × ${item.name} costs **${fmt(total)}** ${ORB} but you only have **${fmt(getBalance(uid))}**.`);
+    return i.editReply({
+      embeds: [embed(`You bought **${amount} × ${item.name}** for **${fmt(total)}** ${ORB}. Use it with \`/use\`.\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '🛒 Purchase complete')],
+    });
+  }
   const roleId = item.roleEnv ? process.env[item.roleEnv] : null;
   if (item.roleEnv && !roleId) return fail(i, `${item.name} isn't set up yet. An admin needs to set \`${item.roleEnv}\`.`);
 
@@ -1100,6 +1175,67 @@ async function handleBuy(i) {
   }
   return i.editReply({
     embeds: [embed(`You bought **${item.name}** for **${fmt(item.price)}** ${ORB}\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '🛒 Purchase complete')],
+  });
+}
+
+/* ───────────── Consumables ───────────── */
+
+// A Speed Potion halves every earn cooldown while it lasts.
+const cooldownMult = (uid, now) => ((q.getBuff.get(uid, 'speed')?.until ?? 0) > now ? 0.5 : 1);
+const usesLeft = (uid, key) => SHOP[key].consumable.daily - (q.getUses.get(uid, key, Math.floor(nowSec() / DAY_SECONDS))?.n ?? 0);
+
+async function handleUse(i) {
+  const key = i.options.getString('item');
+  const item = SHOP[key];
+  const c = item.consumable;
+  const uid = i.user.id;
+  const now = nowSec();
+
+  // Check that it would do something before using it up.
+  if (c.kind === 'speed') {
+    const until = q.getBuff.get(uid, 'speed')?.until ?? 0;
+    if (until > now) return fail(i, `A Speed Potion is already active until <t:${until}:t>.`);
+  }
+  if (c.kind === 'reset') {
+    const waiting = Object.entries(ACTIONS).some(([name, a]) => now < (q.getCd.get(uid, name)?.ts ?? 0) + Math.ceil(a.cooldown * cooldownMult(uid, now)));
+    if (!waiting) return fail(i, 'None of your earn commands are on cooldown, so the Hourglass would be wasted.');
+  }
+
+  const result = useItemTx(uid, key, Math.floor(now / DAY_SECONDS), c.daily);
+  if (result === 'none') return fail(i, `You don't have a ${item.name}. Buy one with \`/buy\`.`);
+  if (result === 'limit') return fail(i, `You've used ${c.daily} today, the daily limit. More <t:${(Math.floor(now / DAY_SECONDS) + 1) * DAY_SECONDS}:R>.`);
+
+  const left = q.getQty.get(uid, key)?.qty ?? 0;
+  const footer = `\n\nYou have **${left}** left · **${usesLeft(uid, key)}** more use${usesLeft(uid, key) === 1 ? '' : 's'} today`;
+  if (c.kind === 'speed') {
+    const until = now + c.minutes * 60;
+    q.setBuff.run(uid, 'speed', until);
+    return i.reply({ embeds: [embed(`All your earn cooldowns are halved until <t:${until}:t> (<t:${until}:R>).${footer}`, `${item.name} active`)] });
+  }
+  // Backdate each cooldown just far enough that it's ready now; the timestamps stay recent for activity counts.
+  for (const [name, a] of Object.entries(ACTIONS)) {
+    if (q.getCd.get(uid, name)) q.setCd.run(uid, name, now - a.cooldown);
+  }
+  return i.reply({ embeds: [embed(`Time rewinds. Every earn command is ready to use again.${footer}`, `${item.name} used`)] });
+}
+
+async function handleInventory(i) {
+  const uid = i.user.id;
+  const now = nowSec();
+  const owned = new Map(q.inventory.all(uid).map((r) => [r.item, r.qty]));
+  const potions = Object.entries(SHOP)
+    .filter(([, s]) => s.consumable)
+    .map(([key, s]) => `**${s.name}** × ${owned.get(key) ?? 0} · ${usesLeft(uid, key)}/${s.consumable.daily} uses left today`)
+    .join('\n');
+  const until = q.getBuff.get(uid, 'speed')?.until ?? 0;
+  const effects = until > now ? `🧪 Speed Potion: cooldowns halved until <t:${until}:t> (<t:${until}:R>)` : 'None';
+  const tools = Object.entries(SHOP)
+    .filter(([key, s]) => s.perk && toolLevel(uid, key))
+    .map(([key, s]) => `**${s.name}** level ${toolLevel(uid, key)} (${toolRange(key, toolLevel(uid, key))} on /${s.perk.action})`)
+    .join('\n') || 'None yet. See `/shop`.';
+  return i.reply({
+    embeds: [embed(`**Consumables**\n${potions}\n\n**Active effects**\n${effects}\n\n**Tools**\n${tools}`, `🎒 ${i.user.username}'s inventory`)],
+    flags: EPH,
   });
 }
 
@@ -1886,6 +2022,8 @@ function helpText(topic) {
       `\`/upgrade\` raises the top of that range, up to level ${MAX_TOOL_LEVEL}. Each level costs twice the last.\n\n` +
       `**Salary boosts:** the Salary Raise (+5%) and Good Resumé (+25%) raise your role salary. You need a paid role, and only the best one counts.\n\n` +
       `**Roles:** Image Permissions and Admin Permissions give you the matching server role.\n\n` +
+      `**Potions:** consumables like the Speed Potion (halves cooldowns for 30 min) and the Hourglass (resets them) stack in your \`/inventory\`. ` +
+      `Buy several with \`/buy amount:\`, then drink one with \`/use\`. Each has a daily limit, and their prices grow with payouts.\n\n` +
       `**/pay** sends orbs to someone. ${Math.round(PAY_TAX * 100)}% is taxed back into the vault.`
     );
   }
@@ -2117,6 +2255,10 @@ client.on(Events.InteractionCreate, async (i) => {
         );
         return i.reply({ embeds: [embed(lines.join('\n\n') + '\n\nUse `/buy` to purchase.', '🛒 Shop')] });
       }
+      case 'use':
+        return await handleUse(i);
+      case 'inventory':
+        return await handleInventory(i);
       case 'buy':
         return await handleBuy(i);
       case 'leaderboard': {
