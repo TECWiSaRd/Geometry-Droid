@@ -10,10 +10,11 @@ Geometry Dash themed Discord economy bot.
 - `/daily`: claim once per UTC day; consecutive days raise the reward (max bonus at day 10)
 - `/upgrade tool`: Diamond Pickaxe and Good Fishing Rod go up to level 5, raising the random payout bonus and costing more each level
 - `/changelog`: shows the latest commit on GitHub (the repo is private, so set `GITHUB_TOKEN` to a token with read access; `CHANGELOG_REPO` overrides the repo)
-- `/achievements [user]`: 15 one-time achievements (earn counts, quiz streaks, drops, daily streak) that pay a scaled orb reward. `/level` shows your badge count
+- `/achievements [user]`: 16 one-time achievements (earn counts, quiz streaks, drops, daily streak) that pay a scaled orb reward. `/level` shows your badge count
 - `/clan create|invite|join|leave|kick|deposit|upgrade|info|top`: clans of up to 20. Founding costs 25,000 (scales like shop prices). Deposits go into an upgrade fund that can never be withdrawn; the owner spends it on clan levels (up to 5), and each level gives every member +1% on earn payouts. If the owner leaves, the longest-standing member takes over
 - `/raid status|start`: a raid boss spawns in the event channel (`EVENT_CHANNEL_ID`, or `DROP_CHANNEL_ID` if unset) an hour after startup, then 72h after each raid ends. HP is 300 per server member (min 3,000). Earn commands, `/daily` and drop wins hit it (10% crit chance). Defeat it within 48h and a 50,000 pool (scales with payouts) is split by damage. Manage Server can start one in the current channel with `/raid start`
 - `/coins [user]`: 15 Secret Coins, three per earn command (named after the first five official levels). Each paid earn has a 3% chance to find one you are missing. Completing a set pays 5,000 (scales with payouts); finding all 15 unlocks the Completionist achievement
+- `/tournament [rounds]` (Manage Server): trivia tournament in the current channel. 60s to join, then 3-10 rounds (default 5) of 15s questions. Right answers score 100 x difficulty plus up to 50 for speed. Top 3 split a 30,000 pool (scales with payouts) 50/30/20. Needs 3+ players; a restart ends a running tournament
 - `/level`, `/prestige`: earn XP from your payouts. Reach level 50 to prestige, which resets XP for +2% payouts per prestige (max 10)
 - `/shop`, `/buy item`: Image Permissions (1,000), Admin Permissions (1 trillion), Salary Raise (20,000, +5% salary), Good Resumé (500,000, +25% salary), Diamond Pickaxe (5,000, +2-10% mining), Good Fishing Rod (4,000, +2-15% fishing)
 - `/salary set|remove|list` (Manage Server): automatic role payments

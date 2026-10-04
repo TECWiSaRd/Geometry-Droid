@@ -71,6 +71,12 @@ const COIN_SETS = { work: 'Stereo Madness', build: 'Back On Track', fish: 'Polar
 const COINS_PER_SET = 3;
 const COIN_CHANCE = 0.03; // per paid earn
 const COIN_SET_REWARD = 5_000; // for completing a set; scales with payouts
+const TOURNEY_JOIN_SECONDS = 60;
+const TOURNEY_ROUNDS = 5;
+const TOURNEY_ROUND_SECONDS = 15;
+const TOURNEY_MIN_PLAYERS = 3;
+const TOURNEY_POOL = 30_000; // split between the top 3; scales with payouts
+const TOURNEY_SPLIT = [0.5, 0.3, 0.2];
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -227,6 +233,7 @@ const ACHIEVEMENTS = [
   { key: 'dedicated', name: '📅 Dedicated', desc: 'Reach a 30-day /daily streak', stat: 'daily_streak', goal: 30, reward: 10_000 },
   { key: 'founder', name: '🏰 Founder', desc: 'Found a clan', stat: 'clan_founded', goal: 1, reward: 1_000 },
   { key: 'demon_slayer', name: '🗡️ Demon Slayer', desc: 'Help defeat 3 raid bosses', stat: 'raids_won', goal: 3, reward: 5_000 },
+  { key: 'champion', name: '🏆 Champion', desc: 'Win a trivia tournament', stat: 'tourney_wins', goal: 1, reward: 3_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
@@ -520,6 +527,7 @@ const fmt = (n) => n.toLocaleString('en-US');
 const rand = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const nowSec = () => Math.floor(Date.now() / 1000);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const embed = (desc, title) => {
   const e = new EmbedBuilder().setColor(COLOR).setDescription(desc);
   if (title) e.setTitle(title);
@@ -663,6 +671,11 @@ const commands = [
     .setDescription('Fight the raid boss together')
     .addSubcommand((s) => s.setName('status').setDescription('Boss HP and top hitters'))
     .addSubcommand((s) => s.setName('start').setDescription('Summon a boss in this channel now (Manage Server)')),
+  new SlashCommandBuilder()
+    .setName('tournament')
+    .setDescription('Start a trivia tournament in this channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10)),
   new SlashCommandBuilder()
     .setName('coins')
     .setDescription('See your Secret Coin collection')
@@ -1367,6 +1380,123 @@ async function handleCoins(i) {
   });
 }
 
+/* ───────────── Trivia tournaments ───────────── */
+
+const tournaments = new Map(); // guildId -> live tournament (in memory; a restart ends it)
+
+const signupEmbed = (t, closed = false) =>
+  embed(
+    `${closed ? 'Signups closed.' : `Click **Join** within **${TOURNEY_JOIN_SECONDS}s**.`} ` +
+      `**${t.rounds}** rounds, **${TOURNEY_ROUND_SECONDS}s** each. Points for every right answer, more for harder and faster ones.\n` +
+      `Top 3 split **${fmt(Math.floor(TOURNEY_POOL * payoutMultiplier()))}** ${ORB}. Needs at least ${TOURNEY_MIN_PLAYERS} players.\n\nPlayers: **${t.players.size}**`,
+    '🏁 Trivia tournament'
+  );
+
+async function runTournament(t) {
+  await sleep(TOURNEY_JOIN_SECONDS * 1000);
+  if (t.players.size < TOURNEY_MIN_PLAYERS) {
+    tournaments.delete(t.guildId);
+    await t.signup.edit({ embeds: [embed(`Only **${t.players.size}** joined, so the tournament was cancelled.`, '🏁 Tournament cancelled')], components: [] }).catch(() => {});
+    return;
+  }
+  t.started = true;
+  await t.signup.edit({ embeds: [signupEmbed(t, true)], components: [] }).catch(() => {});
+
+  for (const [n, qn] of shuffle(TRIVIA).slice(0, t.rounds).entries()) {
+    const options = shuffle([qn.a, ...qn.w]);
+    t.answer = options.indexOf(qn.a);
+    t.answers = new Map();
+    t.round = n + 1;
+    t.roundStart = Date.now();
+    const row = new ActionRowBuilder().addComponents(
+      options.map((label, k) => new ButtonBuilder().setCustomId(`tn:${t.id}:${t.round}:${k}`).setLabel(label).setStyle(ButtonStyle.Secondary))
+    );
+    const msg = await t.channel.send({
+      embeds: [embed(`${qn.q}\n\nDifficulty ${'★'.repeat(qn.d)} · **${TOURNEY_ROUND_SECONDS}s**`, `🏁 Round ${t.round} / ${t.rounds}`)],
+      components: [row],
+    });
+    await sleep(TOURNEY_ROUND_SECONDS * 1000);
+    t.round = 0; // closes the round to late clicks
+
+    const right = [];
+    for (const [uid, a] of t.answers) {
+      if (a.choice !== t.answer) continue;
+      const pts = 100 * qn.d + Math.round(50 * Math.max(0, 1 - a.ms / (TOURNEY_ROUND_SECONDS * 1000)));
+      t.scores.set(uid, (t.scores.get(uid) ?? 0) + pts);
+      right.push([uid, pts]);
+    }
+    right.sort((x, y) => y[1] - x[1]);
+    const who = right.length ? right.map(([uid, pts]) => `<@${uid}> +${pts}`).join(', ') : 'Nobody got it.';
+    await msg.edit({ embeds: [embed(`${qn.q}\n\nAnswer: **${qn.a}**\n${who}`, `🏁 Round ${n + 1} / ${t.rounds}`)], components: [] }).catch(() => {});
+    await sleep(3000);
+  }
+
+  tournaments.delete(t.guildId);
+  const ranked = [...t.scores.entries()].filter(([, s]) => s > 0).sort((x, y) => y[1] - x[1]);
+  const pool = Math.floor(TOURNEY_POOL * payoutMultiplier());
+  const paid = payoutTx(ranked.slice(0, TOURNEY_SPLIT.length).map(([uid], n) => [uid, Math.floor(pool * TOURNEY_SPLIT[n])]));
+  const unlocks = [];
+  ranked.slice(0, TOURNEY_SPLIT.length).forEach(([uid], n) => {
+    const notes = [];
+    if (n === 0) bumpStat(uid, 'tourney_wins', 1, notes);
+    afterEarn(uid, t.guildId, ['tournament'], paid.get(uid) ?? 0, notes);
+    for (const note of notes) unlocks.push(`<@${uid}> ${note}`);
+  });
+  const medals = ['🥇', '🥈', '🥉'];
+  const table = ranked.length
+    ? ranked
+        .slice(0, 10)
+        .map(([uid, s], n) => `${medals[n] ?? `**${n + 1}.**`} <@${uid}> — ${fmt(s)} pts${paid.get(uid) ? `, **${fmt(paid.get(uid))}** ${ORB}` : ''}`)
+        .join('\n')
+    : 'Nobody scored, so no prizes this time.';
+  await t.channel.send({ embeds: [embed(withNotes(table, unlocks), '🏁 Tournament results')] }).catch(() => {});
+}
+
+async function handleTournament(i) {
+  if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return fail(i, 'You need Manage Server for that.');
+  if (tournaments.has(i.guildId)) return fail(i, 'A tournament is already running.');
+  const t = {
+    id: Math.random().toString(36).slice(2, 10),
+    guildId: i.guildId,
+    channel: i.channel,
+    rounds: i.options.getInteger('rounds') ?? TOURNEY_ROUNDS,
+    players: new Set(),
+    scores: new Map(),
+    round: 0,
+    started: false,
+  };
+  tournaments.set(i.guildId, t);
+  const join = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`tn:${t.id}:join`).setLabel('Join').setStyle(ButtonStyle.Success)
+  );
+  await i.reply({ embeds: [signupEmbed(t)], components: [join] });
+  t.signup = await i.fetchReply();
+  runTournament(t).catch((err) => {
+    console.error('Tournament failed:', err);
+    tournaments.delete(t.guildId);
+  });
+}
+
+async function handleTournamentButton(i) {
+  const [, id, round, choice] = i.customId.split(':');
+  const t = [...tournaments.values()].find((x) => x.id === id);
+  if (!t) return i.reply({ content: '❌ This tournament is over.', flags: EPH });
+  const uid = i.user.id;
+
+  if (round === 'join') {
+    if (t.started) return i.reply({ content: '❌ Signups are closed.', flags: EPH });
+    if (t.players.has(uid)) return i.reply({ content: "You're already in.", flags: EPH });
+    t.players.add(uid);
+    return i.update({ embeds: [signupEmbed(t)] });
+  }
+
+  if (!t.players.has(uid)) return i.reply({ content: "❌ You didn't join this tournament.", flags: EPH });
+  if (Number(round) !== t.round) return i.reply({ content: '❌ That round is over.', flags: EPH });
+  if (t.answers.has(uid)) return i.reply({ content: '❌ You already answered this round.', flags: EPH });
+  t.answers.set(uid, { choice: Number(choice), ms: Date.now() - t.roundStart });
+  return i.reply({ content: '🔒 Answer locked in.', flags: EPH });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1485,7 +1615,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
-    const handler = i.customId.startsWith('drop:') ? handleDropButton : handleChallengeButton;
+    const handler = { drop: handleDropButton, tn: handleTournamentButton }[i.customId.split(':')[0]] ?? handleChallengeButton;
     return handler(i).catch(console.error);
   }
   if (!i.isChatInputCommand()) return;
@@ -1554,6 +1684,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleRaid(i);
       case 'coins':
         return await handleCoins(i);
+      case 'tournament':
+        return await handleTournament(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
