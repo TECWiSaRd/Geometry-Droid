@@ -87,6 +87,14 @@ const WEEKLY_GOALS = [
   { stat: 'earns', text: 'Get paid from earn commands', per: 20 },
 ];
 const WEEKLY_REWARD = 5_000; // to every contributor when the goal is met; scales with payouts
+// Seasons: 30 days each, counted from the bot's first start. Points = orbs earned through play,
+// divided by the payout multiplier so later seasons aren't inflated.
+const SEASON_DAYS = 30;
+const SEASON_TIERS = [500, 1_500, 3_000, 5_000, 8_000, 12_000, 17_000, 23_000, 30_000, 40_000]; // pass tiers
+const SEASON_TIER_REWARD = 1_000; // x tier number; scales with payouts
+const SEASON_PRIZES = [100_000, 50_000, 25_000]; // top 3 at season end; scale with payouts
+const SEASON_ROLE_ID = process.env.SEASON_ROLE_ID; // optional: moves to each season's #1
+const SEASON_RESETS_PRESTIGE = false; // true wipes everyone's XP and prestige at each season end
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -245,6 +253,7 @@ const ACHIEVEMENTS = [
   { key: 'demon_slayer', name: '🗡️ Demon Slayer', desc: 'Help defeat 3 raid bosses', stat: 'raids_won', goal: 3, reward: 5_000 },
   { key: 'champion', name: '🏆 Champion', desc: 'Win a trivia tournament', stat: 'tourney_wins', goal: 1, reward: 3_000 },
   { key: 'team_spirit', name: '🤝 Team Spirit', desc: 'Help complete 3 weekly challenges', stat: 'weekly_done', goal: 3, reward: 3_000 },
+  { key: 'season_champ', name: '👑 Season Champion', desc: 'Finish a season in 1st place', stat: 'season_wins', goal: 1, reward: 10_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
@@ -336,6 +345,10 @@ CREATE TABLE IF NOT EXISTS weekly_contrib (
   guild_id TEXT NOT NULL, week INTEGER NOT NULL, user_id TEXT NOT NULL, n INTEGER NOT NULL,
   PRIMARY KEY (guild_id, week, user_id)
 );
+CREATE TABLE IF NOT EXISTS season_points (
+  season INTEGER NOT NULL, user_id TEXT NOT NULL, pts INTEGER NOT NULL, tier INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (season, user_id)
+);
 `);
 
 const q = {
@@ -408,6 +421,11 @@ const q = {
   getContrib: db.prepare('SELECT n FROM weekly_contrib WHERE guild_id = ? AND week = ? AND user_id = ?'),
   contribs: db.prepare('SELECT user_id, n FROM weekly_contrib WHERE guild_id = ? AND week = ? ORDER BY n DESC'),
   activePlayers: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM cooldowns WHERE ts > ?'),
+  addPts: db.prepare('INSERT INTO season_points (season, user_id, pts) VALUES (?, ?, ?) ON CONFLICT(season, user_id) DO UPDATE SET pts = pts + excluded.pts RETURNING pts, tier'),
+  setTier: db.prepare('UPDATE season_points SET tier = ? WHERE season = ? AND user_id = ?'),
+  getPts: db.prepare('SELECT pts, tier FROM season_points WHERE season = ? AND user_id = ?'),
+  seasonTop: db.prepare('SELECT user_id, pts FROM season_points WHERE season = ? ORDER BY pts DESC, user_id LIMIT 10'),
+  seasonRank: db.prepare('SELECT COUNT(*) + 1 AS r FROM season_points WHERE season = ? AND pts > ?'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -705,6 +723,7 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10)),
   new SlashCommandBuilder().setName('weekly').setDescription("See this week's server-wide challenge"),
+  new SlashCommandBuilder().setName('season').setDescription('Season standings and your season pass'),
   new SlashCommandBuilder()
     .setName('coins')
     .setDescription('See your Secret Coin collection')
@@ -1588,6 +1607,90 @@ async function handleWeekly(i) {
   });
 }
 
+/* ───────────── Seasons ───────────── */
+
+const SEASON_SECONDS = SEASON_DAYS * DAY_SECONDS;
+const seasonIndex = () => Math.floor((nowSec() - supplyStart()) / SEASON_SECONDS) + 1;
+const seasonEnd = (season) => supplyStart() + season * SEASON_SECONDS;
+
+// Season points and the pass: every tier you pass pays out right away.
+earnHooks.push(({ uid, granted, notes }) => {
+  if (granted <= 0) return;
+  const season = seasonIndex();
+  const row = q.addPts.get(season, uid, Math.max(1, Math.round(granted / payoutMultiplier())));
+  let tier = row.tier;
+  while (tier < SEASON_TIERS.length && row.pts >= SEASON_TIERS[tier]) {
+    tier += 1;
+    const got = mintTx(uid, Math.floor(SEASON_TIER_REWARD * tier * payoutMultiplier()));
+    notes.push(`🎟️ Season pass tier **${tier}** reached${got ? ` (+${fmt(got)} ${ORB})` : ''}`);
+  }
+  if (tier !== row.tier) q.setTier.run(tier, season, uid);
+});
+
+// Moves the champion role to the winner in every server the bot is in.
+async function moveSeasonRole(winnerId) {
+  if (!SEASON_ROLE_ID) return;
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const members = guild.members.cache.size >= guild.memberCount ? guild.members.cache : await guild.members.fetch();
+      for (const m of members.values()) {
+        if (m.id !== winnerId && m.roles.cache.has(SEASON_ROLE_ID)) await m.roles.remove(SEASON_ROLE_ID);
+      }
+      await members.get(winnerId)?.roles.add(SEASON_ROLE_ID);
+    } catch (err) {
+      console.error(`Season role update failed in ${guild.id}:`, err.message);
+    }
+  }
+}
+
+// Settles finished seasons one at a time: prizes for the top 3, the role, and an announcement.
+async function seasonTick() {
+  const current = seasonIndex();
+  const saved = q.getMeta.get('season_done');
+  if (!saved) return q.setMeta.run('season_done', String(current - 1));
+  const season = Number(saved.value) + 1;
+  if (season >= current) return;
+  q.setMeta.run('season_done', String(season));
+
+  const top = q.seasonTop.all(season);
+  const podium = top.slice(0, SEASON_PRIZES.length);
+  const paid = payoutTx(podium.map((r, n) => [r.user_id, Math.floor(SEASON_PRIZES[n] * payoutMultiplier())]));
+  const unlocks = [];
+  if (podium[0]) {
+    const notes = [];
+    bumpStat(podium[0].user_id, 'season_wins', 1, notes);
+    for (const n of notes) unlocks.push(`<@${podium[0].user_id}> ${n}`);
+    await moveSeasonRole(podium[0].user_id);
+  }
+  if (SEASON_RESETS_PRESTIGE) db.exec('UPDATE progress SET xp = 0, prestige = 0');
+
+  const medals = ['🥇', '🥈', '🥉'];
+  const table = top.length
+    ? top.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.user_id}> — ${fmt(r.pts)} pts${paid.get(r.user_id) ? `, **${fmt(paid.get(r.user_id))}** ${ORB}` : ''}`).join('\n')
+    : 'Nobody played this season.';
+  const reset = SEASON_RESETS_PRESTIGE ? '\n\nLevels and prestige have been reset for the new season.' : '';
+  await announce(withNotes(`${table}${reset}\n\nSeason **${season + 1}** has begun!`, unlocks), `🏁 Season ${season} results`);
+}
+
+async function handleSeason(i) {
+  const season = seasonIndex();
+  const me = q.getPts.get(season, i.user.id) ?? { pts: 0, tier: 0 };
+  const next = me.tier < SEASON_TIERS.length ? `next tier at **${fmt(SEASON_TIERS[me.tier])}** pts` : 'pass complete';
+  const rank = me.pts ? `#${q.seasonRank.get(season, me.pts).r}` : 'unranked';
+  const top = q.seasonTop.all(season).map((r, n) => `**${n + 1}.** <@${r.user_id}> — ${fmt(r.pts)} pts`).join('\n') || 'Nobody has played yet.';
+  const prizes = SEASON_PRIZES.map((p) => fmt(Math.floor(p * payoutMultiplier()))).join(' / ');
+  return i.reply({
+    embeds: [
+      embed(
+        `Ends <t:${seasonEnd(season)}:R>. Earn season points by playing.\n\n` +
+          `Your points: **${fmt(me.pts)}** (${rank})\nSeason pass: tier **${me.tier}** / ${SEASON_TIERS.length}, ${next}\n\n` +
+          `**Top players**\n${top}\n\nTop 3 prizes: ${prizes} ${ORB}${SEASON_ROLE_ID ? `, plus <@&${SEASON_ROLE_ID}> for #1` : ''}`,
+        `🗓️ Season ${season}`
+      ),
+    ],
+  });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1779,6 +1882,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleTournament(i);
       case 'weekly':
         return await handleWeekly(i);
+      case 'season':
+        return await handleSeason(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
@@ -1842,6 +1947,7 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(() => salaryTick().catch(console.error), 60 * 1000);
   setInterval(() => dropTick().catch(console.error), 60 * 1000);
   setInterval(() => raidTick().catch(console.error), 60 * 1000);
+  setInterval(() => seasonTick().catch(console.error), 60 * 1000);
 });
 
 client.login(TOKEN);
