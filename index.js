@@ -7,6 +7,9 @@ import {
   GatewayIntentBits,
   SlashCommandBuilder,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   PermissionFlagsBits,
   MessageFlags,
 } from 'discord.js';
@@ -22,6 +25,21 @@ if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN');
   process.exit(1);
 }
+
+// Supply: starts at START_SUPPLY, grows linearly to TARGET_SUPPLY over SUPPLY_DAYS
+// (and keeps growing at the same daily rate afterwards).
+const START_SUPPLY = 500_000_000;
+const TARGET_SUPPLY = 2_000_000_000_000;
+const SUPPLY_DAYS = 180;
+const DAILY_ADD = (TARGET_SUPPLY - START_SUPPLY) / SUPPLY_DAYS; // ~11.1 billion/day
+const SCALE_PAYOUTS = true; // earn payouts grow with the supply so the economy keeps up
+
+// Anti-AFK / anti-bot checks
+const CHALLENGE_CHANCE = 0.2; // random chance per earn command
+const FORCE_AFTER = 10; // always check after this many earns without one
+const CHALLENGE_SECONDS = 30; // time to answer
+const MAX_FAILS = 3; // fails before lockout
+const LOCK_SECONDS = 60 * 60; // lockout length
 
 const ORB = '🟠';
 const COLOR = 0xffa500;
@@ -132,6 +150,12 @@ CREATE TABLE IF NOT EXISTS salaries (
   guild_id TEXT NOT NULL, role_id TEXT NOT NULL, amount INTEGER NOT NULL,
   PRIMARY KEY (guild_id, role_id)
 );
+CREATE TABLE IF NOT EXISTS strikes (
+  user_id TEXT PRIMARY KEY,
+  fails INTEGER NOT NULL DEFAULT 0,
+  locked_until INTEGER NOT NULL DEFAULT 0,
+  streak INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
 
@@ -150,16 +174,39 @@ const q = {
   setSalary: db.prepare('INSERT OR REPLACE INTO salaries (guild_id, role_id, amount) VALUES (?, ?, ?)'),
   delSalary: db.prepare('DELETE FROM salaries WHERE guild_id = ? AND role_id = ?'),
   salaries: db.prepare('SELECT role_id, amount FROM salaries WHERE guild_id = ? ORDER BY amount DESC'),
+  getStrike: db.prepare('SELECT fails, locked_until, streak FROM strikes WHERE user_id = ?'),
+  upsertStrike: db.prepare('INSERT OR REPLACE INTO strikes (user_id, fails, locked_until, streak) VALUES (?, ?, ?, ?)'),
+  circ: db.prepare('SELECT COALESCE(SUM(balance), 0) AS s FROM users'),
   getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
   setMeta: db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
 
-const earnTx = db.transaction((uid, action, amount, now) => {
+function supplyStart() {
+  const row = q.getMeta.get('supply_start');
+  if (row) return Number(row.value);
+  const t = Math.floor(Date.now() / 1000);
+  q.setMeta.run('supply_start', String(t));
+  return t;
+}
+const supplyCap = () =>
+  Math.floor(START_SUPPLY + (DAILY_ADD * (Math.floor(Date.now() / 1000) - supplyStart())) / 86400);
+const circulating = () => q.circ.get().s;
+const mintable = () => Math.max(0, supplyCap() - circulating());
+const payoutMultiplier = () => (SCALE_PAYOUTS ? Math.max(1, supplyCap() / START_SUPPLY) : 1);
+
+// Orbs can only be minted while circulation is below the cap. Returns what was actually granted.
+const mintTx = db.transaction((uid, amount) => {
   q.ensure.run(uid);
-  q.add.run(amount, amount, uid);
+  const granted = Math.max(0, Math.min(amount, mintable()));
+  if (granted > 0) q.add.run(granted, granted, uid);
+  return granted;
+});
+
+const earnTx = db.transaction((uid, action, amount, now) => {
   q.setCd.run(uid, action, now);
+  return mintTx(uid, amount);
 });
 
 const transferTx = db.transaction((from, to, amount) => {
@@ -186,9 +233,14 @@ const undoBuyTx = db.transaction((uid, key, price) => {
 });
 
 const payoutTx = db.transaction((payouts) => {
+  const total = payouts.reduce((n, [, a]) => n + a, 0);
+  const avail = mintable();
+  const ratio = total > avail ? avail / total : 1; // share what's left if the vault is short
   for (const [uid, amount] of payouts) {
+    const amt = Math.floor(amount * ratio);
+    if (amt <= 0) continue;
     q.ensure.run(uid);
-    q.add.run(amount, amount, uid);
+    q.add.run(amt, amt, uid);
   }
 });
 
@@ -222,6 +274,7 @@ const commands = [
     .setDescription('Send mana orbs to another player')
     .addUserOption((o) => o.setName('user').setDescription('Who to pay').setRequired(true))
     .addIntegerOption((o) => o.setName('amount').setDescription('Orbs to send').setRequired(true).setMinValue(1)),
+  new SlashCommandBuilder().setName('supply').setDescription('See how many orbs exist and are left to earn'),
   new SlashCommandBuilder().setName('shop').setDescription('See what you can buy'),
   new SlashCommandBuilder()
     .setName('buy')
@@ -256,28 +309,170 @@ const commands = [
 
 /* ───────────── Handlers ───────────── */
 
+/* ───────────── Anti-bot challenges ───────────── */
+
+const pending = new Map(); // challengeId -> { userId, reward, answer, timer }
+
+const shuffle = (arr) => {
+  const a = [...arr];
+  for (let n = a.length - 1; n > 0; n--) {
+    const m = Math.floor(Math.random() * (n + 1));
+    [a[n], a[m]] = [a[m], a[n]];
+  }
+  return a;
+};
+
+const TRIVIA = [
+  { q: 'Which is the first official Geometry Dash level?', a: 'Stereo Madness', w: ['Back On Track', 'Polargeist', 'Dry Out', 'Base After Base'] },
+  { q: 'Which is the second official level?', a: 'Back On Track', w: ['Stereo Madness', 'Polargeist', 'Dry Out', 'Base After Base'] },
+  { q: 'Which is the third official level?', a: 'Polargeist', w: ['Stereo Madness', 'Back On Track', 'Dry Out', 'Base After Base'] },
+  { q: 'Who created Geometry Dash?', a: 'RobTop', w: ['Zobros', 'Riot', 'Sailent', 'Hinds'] },
+  { q: 'Which game mode flies like a rocket?', a: 'Ship', w: ['Cube', 'Ball', 'Wave', 'Robot'] },
+  { q: 'Which game mode zig-zags diagonally?', a: 'Wave', w: ['Cube', 'Ship', 'Ball', 'UFO'] },
+];
+
+const SYMBOLS = [
+  ['mana orb', '🟠'], ['star', '⭐'], ['moon', '🌙'], ['spike', '🔺'],
+  ['key', '🔑'], ['diamond', '💎'], ['skull', '💀'], ['fire', '🔥'],
+];
+
+function makeChallenge() {
+  const kind = pick(['math', 'trivia', 'symbol']);
+
+  if (kind === 'math') {
+    const x = rand(3, 25);
+    const y = rand(3, 25);
+    const right = String(x + y);
+    const wrong = new Set();
+    while (wrong.size < 3) {
+      const v = String(x + y + rand(-6, 6));
+      if (v !== right) wrong.add(v);
+    }
+    const options = shuffle([right, ...wrong]);
+    return { prompt: `What is **${x} + ${y}**?`, options, answer: options.indexOf(right) };
+  }
+
+  if (kind === 'trivia') {
+    const t = pick(TRIVIA);
+    const options = shuffle([t.a, ...shuffle(t.w).slice(0, 3)]);
+    return { prompt: t.q, options, answer: options.indexOf(t.a) };
+  }
+
+  const [name, emoji] = pick(SYMBOLS);
+  const others = shuffle(SYMBOLS.filter(([, e]) => e !== emoji)).slice(0, 3).map(([, e]) => e);
+  const options = shuffle([emoji, ...others]);
+  return { prompt: `Click the **${name}**`, options, answer: options.indexOf(emoji) };
+}
+
+const getStrike = (uid) => q.getStrike.get(uid) ?? { fails: 0, locked_until: 0, streak: 0 };
+const saveStrike = (uid, s) => q.upsertStrike.run(uid, s.fails, s.locked_until, s.streak);
+
+function recordFail(uid) {
+  const s = getStrike(uid);
+  s.fails += 1;
+  let lockedUntil = 0;
+  if (s.fails >= MAX_FAILS) {
+    s.fails = 0;
+    lockedUntil = nowSec() + LOCK_SECONDS;
+    s.locked_until = lockedUntil;
+  }
+  saveStrike(uid, s);
+  return lockedUntil;
+}
+
+const rewardEmbed = (uid, r) =>
+  embed(
+    `${r.line} and earned **${fmt(r.amount)}** ${ORB}${r.bonus}\n\nBalance: **${fmt(getBalance(uid))}** ${ORB}`,
+    `${ACTIONS[r.name].emoji} /${r.name}`
+  );
+
+async function sendChallenge(i, reward) {
+  const ch = makeChallenge();
+  const id = Math.random().toString(36).slice(2, 10);
+  const row = new ActionRowBuilder().addComponents(
+    ch.options.map((label, n) =>
+      new ButtonBuilder().setCustomId(`ch:${id}:${n}`).setLabel(label).setStyle(ButtonStyle.Secondary)
+    )
+  );
+
+  const entry = { userId: i.user.id, reward, answer: ch.answer, timer: null };
+  entry.timer = setTimeout(() => {
+    if (!pending.delete(id)) return;
+    const lockedUntil = recordFail(i.user.id);
+    const extra = lockedUntil ? `\n🔒 Too many fails. Locked <t:${lockedUntil}:R>.` : '';
+    i.editReply({ embeds: [embed(`⏰ Too slow, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] }).catch(() => {});
+  }, CHALLENGE_SECONDS * 1000);
+  pending.set(id, entry);
+
+  return i.reply({
+    embeds: [embed(`${ch.prompt}\n\nAnswer within **${CHALLENGE_SECONDS}s** to claim **${fmt(reward.amount)}** ${ORB}`, '🤖 Bot check')],
+    components: [row],
+  });
+}
+
+async function handleChallengeButton(i) {
+  const [tag, id, n] = i.customId.split(':');
+  if (tag !== 'ch') return;
+  const p = pending.get(id);
+  if (!p) return i.reply({ content: '❌ That check expired.', flags: EPH });
+  if (p.userId !== i.user.id) return i.reply({ content: "❌ This isn't your check.", flags: EPH });
+
+  pending.delete(id);
+  clearTimeout(p.timer);
+
+  if (Number(n) === p.answer) {
+    const s = getStrike(i.user.id);
+    s.fails = 0;
+    saveStrike(i.user.id, s);
+    const granted = mintTx(i.user.id, p.reward.amount);
+    if (granted <= 0) {
+      return i.update({ embeds: [embed('Correct! But the orb vault is empty right now. Try again later.', '🏦 Vault empty')], components: [] });
+    }
+    p.reward.amount = granted;
+    return i.update({ embeds: [rewardEmbed(i.user.id, p.reward)], components: [] });
+  }
+
+  const lockedUntil = recordFail(i.user.id);
+  const extra = lockedUntil ? `\n🔒 Too many fails. Locked <t:${lockedUntil}:R>.` : '';
+  return i.update({ embeds: [embed(`❌ Wrong answer, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] });
+}
+
+/* ───────────── Earning ───────────── */
+
 async function handleEarn(i, name) {
   const a = ACTIONS[name];
   const now = nowSec();
-  const last = q.getCd.get(i.user.id, name)?.ts ?? 0;
+  const uid = i.user.id;
+
+  const s = getStrike(uid);
+  if (now < s.locked_until) return fail(i, `🔒 You're locked out for failing bot checks. Try again <t:${s.locked_until}:R>.`);
+  if ([...pending.values()].some((p) => p.userId === uid)) return fail(i, 'Finish your current bot check first.');
+
+  const last = q.getCd.get(uid, name)?.ts ?? 0;
   const readyAt = last + a.cooldown;
   if (now < readyAt) return fail(i, `${a.emoji} You can /${name} again <t:${readyAt}:R>.`);
 
-  let amount = rand(a.min, a.max);
+  let amount = Math.floor(rand(a.min, a.max) * payoutMultiplier());
   let bonus = '';
   if (Math.random() < a.bonusChance) {
     amount *= a.bonusMult;
     bonus = `\n✨ **${a.bonusText}** (x${a.bonusMult})`;
   }
-  earnTx(i.user.id, name, amount, now);
-  return i.reply({
-    embeds: [
-      embed(
-        `${pick(a.lines)} and earned **${fmt(amount)}** ${ORB}${bonus}\n\nBalance: **${fmt(getBalance(i.user.id))}** ${ORB}`,
-        `${a.emoji} /${name}`
-      ),
-    ],
-  });
+  const reward = { name, amount, bonus, line: pick(a.lines) };
+
+  s.streak += 1;
+  if (Math.random() < CHALLENGE_CHANCE || s.streak >= FORCE_AFTER) {
+    s.streak = 0;
+    saveStrike(uid, s);
+    q.setCd.run(uid, name, now); // cooldown starts now, orbs are paid only if solved
+    return sendChallenge(i, reward);
+  }
+
+  saveStrike(uid, s);
+  const granted = earnTx(uid, name, amount, now);
+  if (granted <= 0) return i.reply({ embeds: [embed('The orb vault is empty right now. More orbs are released over time, try again later.', '🏦 Vault empty')] });
+  reward.amount = granted;
+  return i.reply({ embeds: [rewardEmbed(uid, reward)] });
 }
 
 async function handleBuy(i) {
@@ -331,6 +526,7 @@ async function handleSalary(i) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
 client.on(Events.InteractionCreate, async (i) => {
+  if (i.isButton()) return handleChallengeButton(i).catch(console.error);
   if (!i.isChatInputCommand()) return;
   if (!i.inGuild()) return fail(i, 'Use me in a server.');
 
@@ -351,6 +547,18 @@ client.on(Events.InteractionCreate, async (i) => {
           return fail(i, `You only have **${fmt(getBalance(i.user.id))}** ${ORB}.`);
         }
         return i.reply({ content: `${ORB} ${i.user} paid ${target} **${fmt(amount)}** mana orbs.` });
+      }
+      case 'supply': {
+        const cap = supplyCap();
+        const circ = circulating();
+        return i.reply({
+          embeds: [
+            embed(
+              `In circulation: **${fmt(circ)}** ${ORB}\nSupply cap right now: **${fmt(cap)}** ${ORB}\nLeft to earn: **${fmt(Math.max(0, cap - circ))}** ${ORB}\nGrows by about **${fmt(Math.floor(DAILY_ADD))}** ${ORB} per day (target ${fmt(TARGET_SUPPLY)} after ${SUPPLY_DAYS} days).`,
+              '🏦 Orb supply'
+            ),
+          ],
+        });
       }
       case 'shop': {
         const lines = Object.entries(SHOP).map(
@@ -410,13 +618,18 @@ async function salaryTick() {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
-  if (GUILD_ID) {
-    const guild = await c.guilds.fetch(GUILD_ID);
-    await guild.commands.set(commands);
-  } else {
-    await c.application.commands.set(commands);
+  supplyStart();
+  try {
+    if (GUILD_ID) {
+      const guild = await c.guilds.fetch(GUILD_ID);
+      await guild.commands.set(commands);
+    } else {
+      await c.application.commands.set(commands);
+    }
+    console.log('Slash commands registered');
+  } catch (err) {
+    console.error('Command registration failed:', err.message);
   }
-  console.log('Slash commands registered');
   setInterval(() => salaryTick().catch(console.error), 60 * 1000);
 });
 
