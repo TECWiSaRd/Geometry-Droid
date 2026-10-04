@@ -58,6 +58,30 @@ const SHOP = {
     price: Number(process.env.ADMIN_PRICE) || 1_000_000_000_000, // 1 trillion
     roleEnv: 'ADMIN_ROLE_ID',
   },
+  salary_raise: {
+    name: '💰 Salary Raise',
+    desc: '+5% on your role salary. Needs a paid salary. Doesn\'t stack with Good Resumé.',
+    price: 20_000,
+    salaryBoost: 0.05,
+  },
+  good_resume: {
+    name: '📄 Good Resumé',
+    desc: '+25% on your role salary. Needs a paid salary. Replaces the Salary Raise.',
+    price: 500_000,
+    salaryBoost: 0.25,
+  },
+  diamond_pickaxe: {
+    name: '💎 Diamond Pickaxe',
+    desc: '+2-10% (random) on every /mine payout.',
+    price: 5_000,
+    perk: { action: 'mine', min: 2, max: 10 },
+  },
+  good_rod: {
+    name: '🎣 Good Fishing Rod',
+    desc: '+2-15% (random) on every /fish payout.',
+    price: 4_000,
+    perk: { action: 'fish', min: 2, max: 15 },
+  },
 };
 
 const ACTIONS = {
@@ -257,6 +281,14 @@ const embed = (desc, title) => {
 };
 const fail = (i, msg) => i.reply({ content: `❌ ${msg}`, flags: EPH });
 
+// Salary boosts don't stack: the best owned one applies.
+const salaryBoost = (uid) =>
+  Math.max(0, ...Object.entries(SHOP).filter(([k, s]) => s.salaryBoost && q.hasItem.get(uid, k)).map(([, s]) => s.salaryBoost));
+
+// True if the member holds any role that has a /salary payout in this guild.
+const hasPaidSalary = (member, guildId) =>
+  q.salaries.all(guildId).some((r) => member.roles.cache.has(r.role_id));
+
 /* ───────────── Commands ───────────── */
 
 const commands = [
@@ -453,6 +485,9 @@ async function handleEarn(i, name) {
   if (now < readyAt) return fail(i, `${a.emoji} You can /${name} again <t:${readyAt}:R>.`);
 
   let amount = Math.floor(rand(a.min, a.max) * payoutMultiplier());
+  for (const [key, s] of Object.entries(SHOP)) {
+    if (s.perk?.action === name && q.hasItem.get(uid, key)) amount = Math.floor(amount * (1 + rand(s.perk.min, s.perk.max) / 100));
+  }
   let bonus = '';
   if (Math.random() < a.bonusChance) {
     amount *= a.bonusMult;
@@ -478,24 +513,32 @@ async function handleEarn(i, name) {
 async function handleBuy(i) {
   const key = i.options.getString('item');
   const item = SHOP[key];
-  const roleId = process.env[item.roleEnv];
-  if (!roleId) return fail(i, `${item.name} isn't set up yet. An admin needs to set \`${item.roleEnv}\`.`);
+  const uid = i.user.id;
+  const roleId = item.roleEnv ? process.env[item.roleEnv] : null;
+  if (item.roleEnv && !roleId) return fail(i, `${item.name} isn't set up yet. An admin needs to set \`${item.roleEnv}\`.`);
 
-  const result = buyTx(i.user.id, key, item.price, nowSec());
+  if (item.salaryBoost) {
+    if (!hasPaidSalary(i.member, i.guildId)) return fail(i, `${item.name} needs a paid salary. Get a role with a /salary payout first.`);
+    if (salaryBoost(uid) >= item.salaryBoost) return fail(i, `You already have a salary boost at least this good.`);
+  }
+
+  const result = buyTx(uid, key, item.price, nowSec());
   if (result === 'owned') return fail(i, `You already own ${item.name}.`);
   if (result === 'poor') {
-    return fail(i, `You need **${fmt(item.price)}** ${ORB} but only have **${fmt(getBalance(i.user.id))}**.`);
+    return fail(i, `You need **${fmt(item.price)}** ${ORB} but only have **${fmt(getBalance(uid))}**.`);
   }
 
-  try {
-    await i.member.roles.add(roleId);
-  } catch (err) {
-    console.error('Role grant failed, refunding:', err);
-    undoBuyTx(i.user.id, key, item.price);
-    return fail(i, "I couldn't give you the role (check my permissions and role order). You were refunded.");
+  if (roleId) {
+    try {
+      await i.member.roles.add(roleId);
+    } catch (err) {
+      console.error('Role grant failed, refunding:', err);
+      undoBuyTx(uid, key, item.price);
+      return fail(i, "I couldn't give you the role (check my permissions and role order). You were refunded.");
+    }
   }
   return i.reply({
-    embeds: [embed(`You bought **${item.name}** for **${fmt(item.price)}** ${ORB}\nBalance: **${fmt(getBalance(i.user.id))}** ${ORB}`, '🛒 Purchase complete')],
+    embeds: [embed(`You bought **${item.name}** for **${fmt(item.price)}** ${ORB}\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '🛒 Purchase complete')],
   });
 }
 
@@ -606,7 +649,7 @@ async function salaryTick() {
         if (m.user.bot) continue;
         let best = 0;
         for (const r of rows) if (r.amount > best && m.roles.cache.has(r.role_id)) best = r.amount;
-        if (best) payouts.push([m.id, best]);
+        if (best) payouts.push([m.id, Math.floor(best * (1 + salaryBoost(m.id)))]);
       }
       payoutTx(payouts);
       console.log(`Paid salaries to ${payouts.length} members in ${guild.name}`);
