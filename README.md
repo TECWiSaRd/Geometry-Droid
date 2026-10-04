@@ -10,6 +10,7 @@ Geometry Dash themed Discord economy bot.
 - `/daily`: claim once per UTC day; consecutive days raise the reward (max bonus at day 10)
 - `/upgrade tool`: Diamond Pickaxe and Good Fishing Rod go up to level 5, raising the random payout bonus and costing more each level
 - `/changelog`: shows the latest commit on GitHub (the repo is private, so set `GITHUB_TOKEN` to a token with read access; `CHANGELOG_REPO` overrides the repo)
+- `/achievements [user]`: 11 one-time achievements (earn counts, quiz streaks, drops, daily streak) that pay a scaled orb reward. `/level` shows your badge count
 - `/level`, `/prestige`: earn XP from your payouts. Reach level 50 to prestige, which resets XP for +2% payouts per prestige (max 10)
 - `/shop`, `/buy item`: Image Permissions (1,000), Admin Permissions (1 trillion), Salary Raise (20,000, +5% salary), Good Resumé (500,000, +25% salary), Diamond Pickaxe (5,000, +2-10% mining), Good Fishing Rod (4,000, +2-15% fishing)
 - `/salary set|remove|list` (Manage Server): automatic role payments

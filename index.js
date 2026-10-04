@@ -192,6 +192,21 @@ const ACTIONS = {
   },
 };
 
+// Unlocked once each. `stat` is a counter bumped by play (see afterEarn); rewards scale with payouts.
+const ACHIEVEMENTS = [
+  { key: 'first_orbs', name: '👣 First Orbs', desc: 'Earn orbs from any earn command', stat: 'earns', goal: 1, reward: 100 },
+  { key: 'grinder', name: '⚙️ Grinder', desc: 'Get paid from earn commands 500 times', stat: 'earns', goal: 500, reward: 10_000 },
+  { key: 'hard_worker', name: '🔨 Hard Worker', desc: 'Get paid from /work 100 times', stat: 'work', goal: 100, reward: 2_000 },
+  { key: 'architect', name: '🧱 Architect', desc: 'Get paid from /build 100 times', stat: 'build', goal: 100, reward: 3_000 },
+  { key: 'angler', name: '🎣 Angler', desc: 'Get paid from /fish 100 times', stat: 'fish', goal: 100, reward: 1_500 },
+  { key: 'deep_miner', name: '⛏️ Deep Miner', desc: 'Get paid from /mine 100 times', stat: 'mine', goal: 100, reward: 4_000 },
+  { key: 'quiz_whiz', name: '🧠 Quiz Whiz', desc: 'Answer 50 quizzes correctly', stat: 'quiz', goal: 50, reward: 3_000 },
+  { key: 'on_a_roll', name: '🔥 On a Roll', desc: 'Answer 20 quizzes in a row without a miss', stat: 'quiz_streak', goal: 20, reward: 5_000 },
+  { key: 'demon_brain', name: '😈 Demon Brain', desc: 'Answer 10 four-star quiz questions', stat: 'quiz_hard', goal: 10, reward: 4_000 },
+  { key: 'quick_hands', name: '⚡ Quick Hands', desc: 'Win 5 orb drops', stat: 'drop', goal: 5, reward: 2_500 },
+  { key: 'dedicated', name: '📅 Dedicated', desc: 'Reach a 30-day /daily streak', stat: 'daily_streak', goal: 30, reward: 10_000 },
+];
+
 /* ───────────── Database ───────────── */
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -235,6 +250,14 @@ CREATE TABLE IF NOT EXISTS progress (
 CREATE TABLE IF NOT EXISTS drop_wins (
   user_id TEXT PRIMARY KEY, seq INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stats (
+  user_id TEXT NOT NULL, key TEXT NOT NULL, n INTEGER NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
+CREATE TABLE IF NOT EXISTS achievements (
+  user_id TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
 `);
 
 const q = {
@@ -266,6 +289,12 @@ const q = {
   resetXp: db.prepare('UPDATE progress SET xp = 0, prestige = prestige + 1 WHERE user_id = ?'),
   getWin: db.prepare('SELECT seq FROM drop_wins WHERE user_id = ?'),
   setWin: db.prepare('INSERT OR REPLACE INTO drop_wins (user_id, seq) VALUES (?, ?)'),
+  getStat: db.prepare('SELECT n FROM stats WHERE user_id = ? AND key = ?'),
+  addStat: db.prepare('INSERT INTO stats (user_id, key, n) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET n = n + excluded.n RETURNING n'),
+  maxStat: db.prepare('INSERT INTO stats (user_id, key, n) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET n = MAX(n, excluded.n) RETURNING n'),
+  setStat: db.prepare('INSERT OR REPLACE INTO stats (user_id, key, n) VALUES (?, ?, ?)'),
+  addAch: db.prepare('INSERT OR IGNORE INTO achievements (user_id, key, ts) VALUES (?, ?, ?)'),
+  userAchs: db.prepare('SELECT key FROM achievements WHERE user_id = ?'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -385,6 +414,38 @@ const levelOf = (xp) => Math.min(MAX_LEVEL, Math.floor(Math.sqrt(xp / XP_BASE)) 
 const progressOf = (uid) => q.getProg.get(uid) ?? { xp: 0, prestige: 0 };
 const prestigeBonus = (uid) => progressOf(uid).prestige * PRESTIGE_BONUS;
 
+/* ───────────── Stats, achievements and play hooks ───────────── */
+
+// Bumps a player stat and unlocks any achievement it completes. Unlock lines go into notes.
+function bumpStat(uid, key, by, notes, mode = 'add') {
+  const n = (mode === 'max' ? q.maxStat : q.addStat).get(uid, key, by).n;
+  for (const a of ACHIEVEMENTS) {
+    if (a.stat !== key || n < a.goal) continue;
+    if (q.addAch.run(uid, a.key, nowSec()).changes === 0) continue; // already unlocked
+    const granted = mintTx(uid, Math.floor(a.reward * payoutMultiplier()));
+    notes.push(`🏅 Achievement unlocked: **${a.name}**${granted ? ` (+${fmt(granted)} ${ORB})` : ''}`);
+  }
+  return n;
+}
+
+// Runs after orbs are earned through play: earn commands, /daily, drops and events.
+// Salaries and /pay don't count. `events` are stat keys bumped by one (e.g. ['earns', 'mine']).
+// Feature hooks (raids, coins, weekly goals, seasons) push extra lines into notes for the reply.
+const earnHooks = [];
+function afterEarn(uid, guildId, events, granted, notes = []) {
+  for (const e of events) bumpStat(uid, e, 1, notes);
+  for (const hook of earnHooks) hook({ uid, guildId, events, granted, notes });
+  return notes;
+}
+
+const earnEvents = (name, difficulty) => {
+  const events = ['earns', name];
+  if (name === 'quiz') events.push('quiz_streak');
+  if (name === 'quiz' && difficulty === 4) events.push('quiz_hard');
+  return events;
+};
+const withNotes = (text, notes) => (notes.length ? `${text}\n\n${notes.join('\n')}` : text);
+
 /* ───────────── Commands ───────────── */
 
 const commands = [
@@ -428,6 +489,10 @@ const commands = [
     ),
   new SlashCommandBuilder().setName('changelog').setDescription('Show the latest update to the bot'),
   new SlashCommandBuilder().setName('level').setDescription('See your level, XP and prestige'),
+  new SlashCommandBuilder()
+    .setName('achievements')
+    .setDescription('See unlocked achievements and progress')
+    .addUserOption((o) => o.setName('user').setDescription('Someone else')),
   new SlashCommandBuilder().setName('prestige').setDescription(`Reset your level for a permanent payout bonus (needs level ${MAX_LEVEL})`),
   new SlashCommandBuilder()
     .setName('salary')
@@ -563,11 +628,16 @@ function recordFail(uid) {
   return lockedUntil;
 }
 
-const rewardEmbed = (uid, r) =>
+const rewardEmbed = (uid, r, notes = []) =>
   embed(
-    `${r.line} and earned **${fmt(r.amount)}** ${ORB}${r.bonus}\n\nBalance: **${fmt(getBalance(uid))}** ${ORB}`,
+    withNotes(`${r.line} and earned **${fmt(r.amount)}** ${ORB}${r.bonus}`, notes) + `\n\nBalance: **${fmt(getBalance(uid))}** ${ORB}`,
     `${ACTIONS[r.name].emoji} /${r.name}`
   );
+
+// A missed or timed-out quiz breaks the quiz streak.
+const breakQuizStreak = (p) => {
+  if (p.reward.name === 'quiz') q.setStat.run(p.userId, 'quiz_streak', 0);
+};
 
 // Puts a freshly rolled challenge into a pending entry. Quiz questions also set the payout by difficulty.
 function applyChallenge(p, ch) {
@@ -583,6 +653,7 @@ function applyChallenge(p, ch) {
 function armTimer(id, p) {
   p.timer = setTimeout(() => {
     if (!pending.delete(id)) return;
+    breakQuizStreak(p);
     const lockedUntil = recordFail(p.userId);
     const extra = lockedUntil ? `\n🔒 Too many fails. Locked <t:${lockedUntil}:R>.` : '';
     p.origin.editReply({ embeds: [embed(`⏰ Too slow, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] }).catch(() => {});
@@ -646,9 +717,11 @@ async function handleChallengeButton(i) {
       return i.update({ embeds: [embed('Correct! But the orb vault is empty right now. Try again later.', '🏦 Vault empty')], components: [] });
     }
     p.reward.amount = granted;
-    return i.update({ embeds: [rewardEmbed(i.user.id, p.reward)], components: [] });
+    const notes = afterEarn(i.user.id, i.guildId, earnEvents(p.reward.name, p.difficulty), granted);
+    return i.update({ embeds: [rewardEmbed(i.user.id, p.reward, notes)], components: [] });
   }
 
+  breakQuizStreak(p);
   const lockedUntil = recordFail(i.user.id);
   const extra = lockedUntil ? `\n🔒 Too many fails. Locked <t:${lockedUntil}:R>.` : '';
   return i.update({ embeds: [embed(`❌ Wrong answer, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] });
@@ -694,7 +767,8 @@ async function handleEarn(i, name) {
   const granted = earnTx(uid, name, amount, now);
   if (granted <= 0) return i.reply({ embeds: [embed('The orb vault is empty right now. More orbs are released over time, try again later.', '🏦 Vault empty')] });
   reward.amount = granted;
-  return i.reply({ embeds: [rewardEmbed(uid, reward)] });
+  const notes = afterEarn(uid, i.guildId, earnEvents(name), granted);
+  return i.reply({ embeds: [rewardEmbed(uid, reward, notes)] });
 }
 
 async function handleBuy(i) {
@@ -767,9 +841,13 @@ async function handleDaily(i) {
   const granted = mintTx(uid, amount);
   if (granted <= 0) return i.reply({ embeds: [embed('The orb vault is empty right now. Try again later.', '🏦 Vault empty')] });
   q.setDaily.run(uid, today, streak);
+  const notes = [];
+  bumpStat(uid, 'daily_streak', streak, notes, 'max');
+  afterEarn(uid, i.guildId, ['daily'], granted, notes);
   const note = streak >= DAILY_MAX_STREAK ? ' (max streak bonus)' : '';
+  const text = `You claimed **${fmt(granted)}** ${ORB}\nStreak: **${streak}** day${streak === 1 ? '' : 's'}${note}. Miss a day and it resets.`;
   return i.reply({
-    embeds: [embed(`You claimed **${fmt(granted)}** ${ORB}\nStreak: **${streak}** day${streak === 1 ? '' : 's'}${note}. Miss a day and it resets.\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '📅 Daily reward')],
+    embeds: [embed(`${withNotes(text, notes)}\n\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '📅 Daily reward')],
   });
 }
 
@@ -798,7 +876,7 @@ async function handleLevel(i) {
   return i.reply({
     embeds: [
       embed(
-        `Level **${level}** / ${MAX_LEVEL}\nXP: **${fmt(xp)}** (${next})\nPrestige: **${prestige}** / ${MAX_PRESTIGE} (earn payouts +${Math.round(prestige * PRESTIGE_BONUS * 100)}%)`,
+        `Level **${level}** / ${MAX_LEVEL}\nXP: **${fmt(xp)}** (${next})\nPrestige: **${prestige}** / ${MAX_PRESTIGE} (earn payouts +${Math.round(prestige * PRESTIGE_BONUS * 100)}%)\nBadges: **${q.userAchs.all(uid).length}** / ${ACHIEVEMENTS.length} (see \`/achievements\`)`,
         '⭐ Your level'
       ),
     ],
@@ -815,6 +893,17 @@ async function handlePrestige(i) {
   return i.reply({
     embeds: [embed(`Your level and XP reset. Earn payouts are now +${Math.round((prestige + 1) * PRESTIGE_BONUS * 100)}%. Your orbs and items are kept.`, `🌟 Prestige ${prestige + 1}`)],
   });
+}
+
+async function handleAchievements(i) {
+  const user = i.options.getUser('user') ?? i.user;
+  const owned = new Set(q.userAchs.all(user.id).map((r) => r.key));
+  const lines = ACHIEVEMENTS.map((a) => {
+    if (owned.has(a.key)) return `✅ **${a.name}** — ${a.desc}`;
+    const n = Math.min(q.getStat.get(user.id, a.stat)?.n ?? 0, a.goal);
+    return `⬜ **${a.name}** — ${a.desc} (${fmt(n)}/${fmt(a.goal)})`;
+  });
+  return i.reply({ embeds: [embed(lines.join('\n'), `🏅 ${user.username}: ${owned.size}/${ACHIEVEMENTS.length} achievements`)] });
 }
 
 /* ───────────── Orb drops ───────────── */
@@ -893,8 +982,9 @@ async function handleDropButton(i) {
     return i.update({ embeds: [embed('The orb vault is empty, so nobody gets this one.', '🏦 Vault empty')], components: [] });
   }
   q.setWin.run(i.user.id, d.seq);
+  const notes = afterEarn(i.user.id, i.guildId, ['drop'], granted);
   return i.update({
-    embeds: [embed(`<@${i.user.id}> grabbed it and earned **${fmt(granted)}** ${ORB}\nBalance: **${fmt(getBalance(i.user.id))}** ${ORB}`, `🎉 ${d.title} claimed`)],
+    embeds: [embed(`${withNotes(`<@${i.user.id}> grabbed it and earned **${fmt(granted)}** ${ORB}`, notes)}\n\nBalance: **${fmt(getBalance(i.user.id))}** ${ORB}`, `🎉 ${d.title} claimed`)],
     components: [],
   });
 }
@@ -995,6 +1085,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleChangelog(i);
       case 'level':
         return await handleLevel(i);
+      case 'achievements':
+        return await handleAchievements(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
