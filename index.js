@@ -73,7 +73,7 @@ const COIN_CHANCE = 0.03; // per paid earn
 const COIN_SET_REWARD = 5_000; // for completing a set; scales with payouts
 const TOURNEY_JOIN_SECONDS = 60;
 const TOURNEY_ROUNDS = 5;
-const TOURNEY_ROUND_SECONDS = 15;
+const TOURNEY_ROUND_SECONDS = 30; // same as other trivia (TRIVIA_SECONDS)
 const TOURNEY_MIN_PLAYERS = 3;
 const TOURNEY_POOL = 30_000; // split between the top 3; scales with payouts
 const TOURNEY_SPLIT = [0.5, 0.3, 0.2];
@@ -101,14 +101,14 @@ const LOTW_REWARD_PER_STAR = 2_000; // per star of the featured level; scales wi
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
 const FORCE_AFTER = 10; // always check after this many earns without one
-const CHALLENGE_SECONDS = 30; // time to answer
-const TRIVIA_SECONDS = 10; // trivia questions are quick reads
+const CHALLENGE_SECONDS = 10; // time to answer math and "click the orb" checks
+const TRIVIA_SECONDS = 30; // trivia (bot checks and /quiz) needs time to read
 const QUIZ_SKIPS = 3; // skips per /quiz, each one rerolls the question
 const DIFF_MULT = { 1: 0.5, 2: 1, 3: 2, 4: 3 }; // /quiz payout by question difficulty
 const MAX_FAILS = 3; // fails before lockout
 const LOCK_SECONDS = 60 * 60; // lockout length
 
-const ORB = '🟠';
+const ORB = process.env.ORB_EMOJI || '<:Mana_Orbs:1556341873054843022>';
 const COLOR = 0xffa500;
 const EPH = MessageFlags.Ephemeral;
 
@@ -1983,7 +1983,7 @@ async function spawnDrop() {
   const seq = Number(q.getMeta.get('drop_seq')?.value ?? 0) + 1;
   q.setMeta.run('drop_seq', String(seq));
   const prize = Math.floor((golden ? 5 : 1) * DROP_BASE * payoutMultiplier());
-  const title = golden ? '✨ Golden Orb' : '🟠 Orb Drop';
+  const title = golden ? '✨ Golden Orb' : `${ORB} Orb Drop`;
   const id = Math.random().toString(36).slice(2, 10);
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`drop:${id}`).setLabel('Grab it!').setStyle(ButtonStyle.Success)

@@ -6,7 +6,7 @@ Geometry Dash themed Discord economy bot.
 - `/help [topic]`: private guide with pages for basics, earning, shop, progress, clans, events and admin commands. Numbers come from the live settings
 - `/balance [user]`, `/leaderboard`
 - `/work` (5m), `/build` (10m), `/fish` (3m), `/mine` (15m): earn orbs, with rare bonus rolls
-- `/quiz` (3m): answer a Geometry Dash trivia question within 10s. Base 200-500 orbs, scaled by question difficulty (0.5x to 3x). Up to 3 skips reroll the question. Always a challenge; wrong answers count as fails
+- `/quiz` (3m): answer a Geometry Dash trivia question within 30s. Base 200-500 orbs, scaled by question difficulty (0.5x to 3x). Up to 3 skips reroll the question. Always a challenge; wrong answers count as fails
 - `/pay user amount`: 10% tax (rounded up) goes back to the vault; transfers must be at least 2 orbs
 - `/daily`: claim once per UTC day; consecutive days raise the reward (max bonus at day 10)
 - `/upgrade tool`: Diamond Pickaxe and Good Fishing Rod go up to level 5, raising the random payout bonus and costing more each level
@@ -15,7 +15,7 @@ Geometry Dash themed Discord economy bot.
 - `/clan create|invite|join|leave|kick|deposit|upgrade|info|top`: clans of up to 20. Founding costs 25,000 (scales like shop prices). Deposits go into an upgrade fund that can never be withdrawn; the owner spends it on clan levels (up to 5), and each level gives every member +1% on earn payouts. If the owner leaves, the longest-standing member takes over
 - `/raid status|start`: a raid boss spawns in the event channel (`EVENT_CHANNEL_ID`, or `DROP_CHANNEL_ID` if unset) an hour after startup, then 72h after each raid ends. HP is 300 per server member (min 3,000). Earn commands, `/daily` and drop wins hit it (10% crit chance). Defeat it within 48h and a 50,000 pool (scales with payouts) is split by damage. Manage Server can start one in the current channel with `/raid start`
 - `/coins [user]`: 15 Secret Coins, three per earn command (named after the first five official levels). Each paid earn has a 3% chance to find one you are missing. Completing a set pays 5,000 (scales with payouts); finding all 15 unlocks the Completionist achievement
-- `/tournament [rounds]` (Manage Server): trivia tournament in the current channel. 60s to join, then 3-10 rounds (default 5) of 15s questions. Right answers score 100 x difficulty plus up to 50 for speed. Top 3 split a 30,000 pool (scales with payouts) 50/30/20. Needs 3+ players; a restart ends a running tournament
+- `/tournament [rounds]` (Manage Server): trivia tournament in the current channel. 60s to join, then 3-10 rounds (default 5) of 30s questions. Right answers score 100 x difficulty plus up to 50 for speed. Top 3 split a 30,000 pool (scales with payouts) 50/30/20. Needs 3+ players; a restart ends a running tournament
 - `/weekly`: a server-wide goal that rotates every Monday (UTC), e.g. "Mine 40 times as a server". The target scales with players active in the last 7 days (min 5). When it is met, everyone who contributed gets 5,000 (scales with payouts) and it is announced in the event channel
 - `/season`: 30-day seasons counted from the bot's first start. Orbs earned through play give season points (in base orbs, so later seasons are not inflated). A 10-tier season pass pays out automatically as you climb. When a season ends the top 3 get 100,000 / 50,000 / 25,000 (scale with payouts), results are announced in the event channel, and `SEASON_ROLE_ID` (optional) moves to the new #1. Set `SEASON_RESETS_PRESTIGE = true` in `index.js` to also wipe XP and prestige each season (off by default)
 - `/lotw info|submit|set|end`: Level of the Week. A moderator (Manage Server) features a level with `/lotw set level_id name stars`. Players beat it and send a screenshot or video with `/lotw submit`; the bot re-uploads it to `LOTW_REVIEW_CHANNEL_ID` (or the current channel) with Approve/Reject buttons for moderators. You cannot review your own clear, and rejected players can resubmit. A verified clear pays 2,000 per star (scales with payouts)
@@ -46,6 +46,7 @@ ADMIN_ROLE_ID=role-id
 DB_PATH=/data/orbs.db
 SALARY_INTERVAL_MINUTES=60
 # ADMIN_PRICE=1000000000000   (optional override)
+# ORB_EMOJI=<:name:emoji-id>        optional; overrides the default <:Mana_Orbs:1556341873054843022>
 # Optional channels and roles:
 # DROP_CHANNEL_ID=channel-id          orb drops
 # EVENT_CHANNEL_ID=channel-id         raids, weekly and season announcements (defaults to DROP_CHANNEL_ID)
@@ -62,7 +63,7 @@ Railway runs `npm start` automatically.
 Circulation is capped at 500,000,000 orbs on launch day, and the cap grows linearly by about 11.1 billion per day, reaching 2 trillion after 180 days (it keeps growing at that rate after). Earn commands and salaries can only mint orbs while circulation is under the cap; orbs spent in the shop go back into the vault. Earn payouts scale up with the cap so the economy keeps pace. `/supply` shows the numbers. Settings are at the top of `index.js`.
 
 ## Anti-bot checks
-`/work`, `/build`, `/fish` and `/mine` sometimes (20% of the time, and always after 10 in a row) show a button challenge: math, GD trivia, or "click the orb". Orbs are paid only if you answer correctly within 30s. 3 fails locks you out of earning for 1 hour. Tune `CHALLENGE_CHANCE`, `FORCE_AFTER`, `CHALLENGE_SECONDS`, `MAX_FAILS` and `LOCK_SECONDS` at the top of `index.js`.
+`/work`, `/build`, `/fish` and `/mine` sometimes (20% of the time, and always after 10 in a row) show a button challenge: math, GD trivia, or "click the orb". Orbs are paid only if you answer correctly within 10s (30s for trivia). 3 fails locks you out of earning for 1 hour. Tune `CHALLENGE_CHANCE`, `FORCE_AFTER`, `CHALLENGE_SECONDS`, `MAX_FAILS` and `LOCK_SECONDS` at the top of `index.js`.
 
 ## Salaries
 Example: `/salary set @Owner 50000`, `/salary set @Admin 20000`, `/salary set @Mod 5000`. Everyone with the role is paid every `SALARY_INTERVAL_MINUTES`. If someone has several paid roles they get the highest one only.
