@@ -97,6 +97,23 @@ const SEASON_ROLE_ID = process.env.SEASON_ROLE_ID; // optional: moves to each se
 const SEASON_RESETS_PRESTIGE = false; // true wipes everyone's XP and prestige at each season end
 const LOTW_REVIEW_CHANNEL_ID = process.env.LOTW_REVIEW_CHANNEL_ID; // optional: where clear proofs go for review
 const LOTW_REWARD_PER_STAR = 2_000; // per star of the featured level; scales with payouts
+// Stocks follow real Geometry Dash stats, refreshed every STOCK_POLL_MINUTES.
+// Level stocks follow download momentum (GDBrowser): downloads in the last 24h vs the level's
+// average day over up to 7 days. Player stocks follow the player's Demonlist score (Pointercrate).
+const STOCKS = {
+  BLD: { name: 'Bloodbath', kind: 'level', id: '10565740' },
+  SNW: { name: 'Sonic Wave', kind: 'level', id: '26681070' },
+  TDL: { name: 'Tidal Wave', kind: 'level', id: '86407629' },
+  ACH: { name: 'Acheron', kind: 'level', id: '73667628' },
+  ZNK: { name: 'Zoink', kind: 'player', id: 53408 },
+  POP: { name: 'wPopoff', kind: 'player', id: 51613 },
+};
+const STOCK_BASE = 1_000; // price at a stock's usual level. Fixed, so holding doesn't ride payout growth for free
+const STOCK_RANGE = [0.25, 4]; // price floor and ceiling, as multiples of the base
+const STOCK_FEE = 0.02; // on buys and sells; goes back to the vault
+const STOCK_POLL_MINUTES = 15;
+const STOCK_STALE_MINUTES = 60; // trading pauses on a stock whose data is older than this
+const STOCK_NEWS_MOVE = 0.1; // announce moves of 10%+ in one update
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -388,6 +405,12 @@ CREATE TABLE IF NOT EXISTS item_uses (
   user_id TEXT NOT NULL, item TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
   PRIMARY KEY (user_id, item, day)
 );
+CREATE TABLE IF NOT EXISTS stock_samples (sym TEXT NOT NULL, ts INTEGER NOT NULL, value REAL NOT NULL, PRIMARY KEY (sym, ts));
+CREATE TABLE IF NOT EXISTS stock_prices (sym TEXT NOT NULL, ts INTEGER NOT NULL, price INTEGER NOT NULL, PRIMARY KEY (sym, ts));
+CREATE TABLE IF NOT EXISTS holdings (
+  user_id TEXT NOT NULL, sym TEXT NOT NULL, shares INTEGER NOT NULL CHECK (shares >= 0), cost INTEGER NOT NULL,
+  PRIMARY KEY (user_id, sym)
+);
 `);
 
 const q = {
@@ -484,6 +507,20 @@ const q = {
   setBuff: db.prepare('INSERT OR REPLACE INTO buffs (user_id, buff, until) VALUES (?, ?, ?)'),
   getUses: db.prepare('SELECT n FROM item_uses WHERE user_id = ? AND item = ? AND day = ?'),
   addUse: db.prepare('INSERT INTO item_uses (user_id, item, day, n) VALUES (?, ?, ?, 1) ON CONFLICT(user_id, item, day) DO UPDATE SET n = n + 1'),
+  addSample: db.prepare('INSERT OR REPLACE INTO stock_samples (sym, ts, value) VALUES (?, ?, ?)'),
+  lastSample: db.prepare('SELECT ts, value FROM stock_samples WHERE sym = ? ORDER BY ts DESC LIMIT 1'),
+  sampleBefore: db.prepare('SELECT ts, value FROM stock_samples WHERE sym = ? AND ts <= ? ORDER BY ts DESC LIMIT 1'),
+  firstSampleSince: db.prepare('SELECT ts, value FROM stock_samples WHERE sym = ? AND ts >= ? ORDER BY ts LIMIT 1'),
+  addPrice: db.prepare('INSERT OR REPLACE INTO stock_prices (sym, ts, price) VALUES (?, ?, ?)'),
+  lastPrice: db.prepare('SELECT ts, price FROM stock_prices WHERE sym = ? ORDER BY ts DESC LIMIT 1'),
+  priceBefore: db.prepare('SELECT price FROM stock_prices WHERE sym = ? AND ts <= ? ORDER BY ts DESC LIMIT 1'),
+  pricesSince: db.prepare('SELECT price FROM stock_prices WHERE sym = ? AND ts >= ? ORDER BY ts'),
+  pruneSamples: db.prepare('DELETE FROM stock_samples WHERE ts < ?'),
+  prunePrices: db.prepare('DELETE FROM stock_prices WHERE ts < ?'),
+  getHolding: db.prepare('SELECT shares, cost FROM holdings WHERE user_id = ? AND sym = ?'),
+  addHolding: db.prepare('INSERT INTO holdings (user_id, sym, shares, cost) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, sym) DO UPDATE SET shares = shares + excluded.shares, cost = cost + excluded.cost'),
+  setHolding: db.prepare('UPDATE holdings SET shares = ?, cost = ? WHERE user_id = ? AND sym = ?'),
+  holdings: db.prepare('SELECT sym, shares, cost FROM holdings WHERE user_id = ? AND shares > 0'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -547,6 +584,30 @@ const buyStackTx = db.transaction((uid, key, total, amount) => {
   q.sub.run(total, uid);
   q.addQty.run(uid, key, amount);
   return 'ok';
+});
+
+// Buying removes orbs from circulation; the fee is included in the cost basis.
+const buyStockTx = db.transaction((uid, sym, shares, price) => {
+  const cost = Math.ceil(shares * price * (1 + STOCK_FEE));
+  q.ensure.run(uid);
+  if (getBalance(uid) < cost) return { result: 'poor', cost };
+  q.sub.run(cost, uid);
+  q.addHolding.run(uid, sym, shares, cost);
+  return { result: 'ok', cost };
+});
+
+// Selling is paid from the vault like earning, so it can't push circulation past the cap.
+// Not counted as earned orbs or XP.
+const sellStockTx = db.transaction((uid, sym, shares, price) => {
+  const h = q.getHolding.get(uid, sym);
+  if (!h || h.shares < shares) return { result: 'short', have: h?.shares ?? 0 };
+  const proceeds = Math.floor(shares * price * (1 - STOCK_FEE));
+  if (proceeds > mintable()) return { result: 'vault', proceeds };
+  const basis = Math.round((h.cost * shares) / h.shares);
+  q.setHolding.run(h.shares - shares, h.cost - basis, uid, sym);
+  q.ensure.run(uid);
+  q.refund.run(proceeds, uid);
+  return { result: 'ok', proceeds, basis };
 });
 
 // Takes one from the inventory if the player has one and hasn't hit today's limit.
@@ -732,6 +793,7 @@ const commands = [
           { name: 'Progress', value: 'progress' },
           { name: 'Clans', value: 'social' },
           { name: 'Events', value: 'events' },
+          { name: 'Stocks', value: 'stocks' },
           { name: 'Admin', value: 'admin' }
         )
     ),
@@ -773,6 +835,34 @@ const commands = [
         .addChoices(...Object.entries(SHOP).filter(([, s]) => s.consumable).map(([value, s]) => ({ name: s.name, value })))
     ),
   new SlashCommandBuilder().setName('inventory').setDescription('Your potions, active effects and tools'),
+  new SlashCommandBuilder().setName('stocks').setDescription('Stock prices, driven by real Geometry Dash stats'),
+  new SlashCommandBuilder()
+    .setName('stock')
+    .setDescription('Trade stocks or look one up')
+    .addSubcommand((s) =>
+      s
+        .setName('buy')
+        .setDescription(`Buy shares (${STOCK_FEE * 100}% fee)`)
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+        .addIntegerOption((o) => o.setName('shares').setDescription('How many shares').setRequired(true).setMinValue(1).setMaxValue(1_000_000))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('sell')
+        .setDescription(`Sell shares (${STOCK_FEE * 100}% fee)`)
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+        .addIntegerOption((o) => o.setName('shares').setDescription('How many shares (default: all)').setMinValue(1).setMaxValue(1_000_000))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('info')
+        .setDescription('What a stock tracks and its recent prices')
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+    ),
+  new SlashCommandBuilder()
+    .setName('portfolio')
+    .setDescription('Your shares, their value and your profit or loss')
+    .addUserOption((o) => o.setName('user').setDescription('Someone else')),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Richest players'),
   new SlashCommandBuilder().setName('daily').setDescription('Claim your daily orbs. Keep a streak for bigger rewards'),
   new SlashCommandBuilder()
@@ -1985,6 +2075,194 @@ async function handleLotwButton(i) {
   });
 }
 
+/* ───────────── Stocks ───────────── */
+
+function stockChoices() {
+  return Object.entries(STOCKS).map(([sym, x]) => ({ name: `${sym} · ${x.name}`, value: sym }));
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'gd-orbs-bot (Discord economy bot)' }, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`${url} returned ${res.status}`);
+  return res.json();
+}
+
+const clampRatio = (r) => Math.min(STOCK_RANGE[1], Math.max(STOCK_RANGE[0], Number.isFinite(r) ? r : 1));
+
+// Level stocks: downloads in the last 24h vs the level's average day. Until there's enough
+// history for a real average (36h+), the stock sits at its base price.
+function levelRatio(sym, now) {
+  const latest = q.lastSample.get(sym);
+  const dayAgo = q.sampleBefore.get(sym, now - DAY_SECONDS);
+  const oldest = q.firstSampleSince.get(sym, now - 7 * DAY_SECONDS);
+  if (!latest || !dayAgo || !oldest) return 1;
+  const span = (latest.ts - oldest.ts) / DAY_SECONDS;
+  if (span < 1.5) return 1;
+  const recent = (latest.value - dayAgo.value) / ((latest.ts - dayAgo.ts) / DAY_SECONDS);
+  const usual = (latest.value - oldest.value) / span;
+  return usual > 0 ? recent / usual : 1;
+}
+
+// Player stocks: score relative to the score when the bot first saw it.
+function playerRatio(sym, score) {
+  const key = `stock_base:${sym}`;
+  const base = Number(q.getMeta.get(key)?.value ?? 0);
+  if (!base) {
+    q.setMeta.run(key, String(score));
+    return 1;
+  }
+  return score / base;
+}
+
+// Pulls fresh stats, records prices and announces big moves. A failed source just leaves that
+// stock's price unchanged (and paused once it goes stale).
+async function stockTick() {
+  const now = nowSec();
+  const anyPlayers = Object.values(STOCKS).some((x) => x.kind === 'player');
+  const ranking = anyPlayers ? await fetchJson('https://pointercrate.com/api/v1/players/ranking/?limit=100').catch((err) => {
+    console.error('Demonlist fetch failed:', err.message);
+    return null;
+  }) : null;
+
+  const moves = [];
+  for (const [sym, x] of Object.entries(STOCKS)) {
+    try {
+      const value = x.kind === 'level' ? (await fetchJson(`https://gdbrowser.com/api/level/${x.id}`)).downloads : ranking?.find((p) => p.id === x.id)?.score;
+      if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('no data');
+      q.addSample.run(sym, now, value);
+      const ratio = x.kind === 'level' ? levelRatio(sym, now) : playerRatio(sym, value);
+      const price = Math.round(STOCK_BASE * clampRatio(ratio));
+      const prev = q.lastPrice.get(sym)?.price;
+      q.addPrice.run(sym, now, price);
+      if (prev && Math.abs(price - prev) / prev >= STOCK_NEWS_MOVE) moves.push({ sym, x, prev, price });
+    } catch (err) {
+      console.error(`Stock ${sym} update failed:`, err.message);
+    }
+  }
+  q.pruneSamples.run(now - 8 * DAY_SECONDS);
+  q.prunePrices.run(now - 8 * DAY_SECONDS);
+
+  if (moves.length) {
+    const lines = moves.map(({ sym, x, prev, price }) => {
+      const pct = Math.round(((price - prev) / prev) * 100);
+      const why = x.kind === 'level' ? `${x.name} is being played ${pct > 0 ? 'more' : 'less'} than usual` : `${x.name}'s Demonlist score ${pct > 0 ? 'rose' : 'fell'}`;
+      return `${pct > 0 ? '📈' : '📉'} **${sym}** ${pct > 0 ? '+' : ''}${pct}% (${fmt(prev)} → ${fmt(price)} ${ORB}): ${why}`;
+    });
+    await announce(lines.join('\n'), '📰 Market news');
+  }
+}
+
+// Current price, or null while the data is stale (trading pauses).
+function livePrice(sym) {
+  const row = q.lastPrice.get(sym);
+  if (!row || nowSec() - row.ts > STOCK_STALE_MINUTES * 60) return null;
+  return row.price;
+}
+
+const SPARK = '▁▂▃▄▅▆▇█';
+function sparkline(sym, since) {
+  const prices = q.pricesSince.all(sym, since).map((r) => r.price);
+  if (prices.length < 2) return '';
+  const step = Math.max(1, Math.floor(prices.length / 16));
+  const pts = prices.filter((_, n) => n % step === 0).slice(-16);
+  const lo = Math.min(...pts);
+  const hi = Math.max(...pts);
+  return pts.map((p) => SPARK[hi === lo ? 3 : Math.round(((p - lo) / (hi - lo)) * 7)]).join('');
+}
+
+function dayChange(sym, price) {
+  const old = q.priceBefore.get(sym, nowSec() - DAY_SECONDS)?.price;
+  if (!old) return '';
+  const pct = ((price - old) / old) * 100;
+  return `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+}
+
+async function handleStocks(i) {
+  const lines = Object.entries(STOCKS).map(([sym, x]) => {
+    const last = q.lastPrice.get(sym);
+    if (!last) return `**${sym}** ${x.name} — waiting for data`;
+    const live = livePrice(sym);
+    const change = dayChange(sym, last.price);
+    return `**${sym}** ${x.name} — **${fmt(last.price)}** ${ORB} ${change ? `(${change} 24h)` : ''} ${sparkline(sym, nowSec() - DAY_SECONDS)}${live ? '' : ' ⏸️ paused'}`;
+  });
+  return i.reply({
+    embeds: [embed(`${lines.join('\n')}\n\nPrices follow real GD stats and update every ${STOCK_POLL_MINUTES} min. \`/stock info\` explains each one.`, '📈 Stock market')],
+  });
+}
+
+async function handleStock(i) {
+  const sub = i.options.getSubcommand();
+  const sym = i.options.getString('symbol');
+  const x = STOCKS[sym];
+  const uid = i.user.id;
+
+  if (sub === 'info') {
+    const last = q.lastPrice.get(sym);
+    const sample = q.lastSample.get(sym);
+    let detail;
+    if (x.kind === 'level') {
+      const dayAgo = q.sampleBefore.get(sym, nowSec() - DAY_SECONDS);
+      const recent = sample && dayAgo ? `\nDownloads in the last 24h: **${fmt(Math.round(sample.value - dayAgo.value))}**` : '\nBuilding up 24h of download history.';
+      detail = `Tracks how much **${x.name}** (level ID \`${x.id}\`) is being played: downloads in the last 24h vs its average day.\nTotal downloads: **${sample ? fmt(Math.round(sample.value)) : '?'}**${recent}`;
+    } else {
+      detail = `Tracks **${x.name}**'s Demonlist score on Pointercrate.\nCurrent score: **${sample ? sample.value.toFixed(2) : '?'}**`;
+    }
+    const price = last ? `**${fmt(last.price)}** ${ORB} ${dayChange(sym, last.price) ? `(${dayChange(sym, last.price)} 24h)` : ''}` : 'waiting for data';
+    const week = sparkline(sym, nowSec() - 7 * DAY_SECONDS);
+    const paused = last && !livePrice(sym) ? '\n⏸️ Trading is paused until fresh data arrives.' : '';
+    return i.reply({ embeds: [embed(`${detail}\n\nPrice: ${price}${week ? `\n7 days: ${week}` : ''}${paused}`, `📈 ${sym} · ${x.name}`)] });
+  }
+
+  const price = livePrice(sym);
+  if (!price) return fail(i, `Trading on **${sym}** is paused until fresh data arrives. Try again soon.`);
+
+  if (sub === 'buy') {
+    const shares = i.options.getInteger('shares');
+    const r = buyStockTx(uid, sym, shares, price);
+    if (r.result === 'poor') return fail(i, `${fmt(shares)} ${sym} at ${fmt(price)} costs **${fmt(r.cost)}** ${ORB} with the fee, but you have **${fmt(getBalance(uid))}**.`);
+    return i.reply({
+      embeds: [embed(`You bought **${fmt(shares)} ${sym}** at **${fmt(price)}** ${ORB} for **${fmt(r.cost)}** ${ORB} (fee included).\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '📈 Bought')],
+    });
+  }
+
+  const have = q.getHolding.get(uid, sym)?.shares ?? 0;
+  const shares = i.options.getInteger('shares') ?? have;
+  if (!have) return fail(i, `You don't own any ${sym}.`);
+  const r = sellStockTx(uid, sym, shares, price);
+  if (r.result === 'short') return fail(i, `You only have **${fmt(r.have)}** ${sym}.`);
+  if (r.result === 'vault') return fail(i, `The orb vault can't cover **${fmt(r.proceeds)}** ${ORB} right now. Try again later or sell fewer shares.`);
+  const pl = r.proceeds - r.basis;
+  return i.reply({
+    embeds: [
+      embed(
+        `You sold **${fmt(shares)} ${sym}** at **${fmt(price)}** ${ORB} for **${fmt(r.proceeds)}** ${ORB} (fee included).\n` +
+          `${pl >= 0 ? 'Profit' : 'Loss'}: **${pl >= 0 ? '+' : '-'}${fmt(Math.abs(pl))}** ${ORB}\nBalance: **${fmt(getBalance(uid))}** ${ORB}`,
+        pl >= 0 ? '📈 Sold' : '📉 Sold'
+      ),
+    ],
+  });
+}
+
+async function handlePortfolio(i) {
+  const user = i.options.getUser('user') ?? i.user;
+  const rows = q.holdings.all(user.id);
+  if (!rows.length) return i.reply({ embeds: [embed(`${user} doesn't own any stocks. See \`/stocks\`.`, '💼 Portfolio')] });
+  let value = 0;
+  let cost = 0;
+  const lines = rows.map((h) => {
+    const price = q.lastPrice.get(h.sym)?.price ?? 0;
+    const worth = h.shares * price;
+    value += worth;
+    cost += h.cost;
+    const pl = worth - h.cost;
+    return `**${h.sym}** × ${fmt(h.shares)} — ${fmt(worth)} ${ORB} (${pl >= 0 ? '+' : '-'}${fmt(Math.abs(pl))})`;
+  });
+  const pl = value - cost;
+  return i.reply({
+    embeds: [embed(`${lines.join('\n')}\n\nValue: **${fmt(value)}** ${ORB} · Paid: **${fmt(cost)}** ${ORB}\n${pl >= 0 ? 'Profit' : 'Loss'} if sold now (before fees): **${pl >= 0 ? '+' : '-'}${fmt(Math.abs(pl))}** ${ORB}`, `💼 ${user.username}'s portfolio`)],
+  });
+}
+
 /* ───────────── Help ───────────── */
 
 const HELP_TOPICS = {
@@ -1994,6 +2272,7 @@ const HELP_TOPICS = {
   progress: '⭐ Progress',
   social: '🏰 Clans',
   events: '🎉 Events',
+  stocks: '📈 Stocks',
   admin: '🛠️ Admin',
 };
 
@@ -2056,6 +2335,17 @@ function helpText(topic) {
       `**Weekly challenge:** a server-wide goal that changes every Monday. Everyone who helps gets paid when it's done. See \`/weekly\`.\n\n` +
       `**Tournaments:** moderators run trivia tournaments. Answer fast and right to win, and the top 3 split the prize.\n\n` +
       `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it and you get paid by star rating.`
+    );
+  }
+  if (topic === 'stocks') {
+    const levels = Object.entries(STOCKS).filter(([, x]) => x.kind === 'level').map(([sym, x]) => `**${sym}** ${x.name}`).join(', ');
+    const players = Object.entries(STOCKS).filter(([, x]) => x.kind === 'player').map(([sym, x]) => `**${sym}** ${x.name}`).join(', ');
+    return (
+      `Stocks move with real Geometry Dash stats, updated every ${STOCK_POLL_MINUTES} minutes.\n\n` +
+      `**Level stocks** (${levels}) rise when the level gets played more than usual. The price compares its downloads in the last 24h with its average day.\n\n` +
+      `**Player stocks** (${players}) follow that player's Demonlist score, so they jump when the player beats a new demon.\n\n` +
+      `A stock at its usual level is worth about **${fmt(STOCK_BASE)}** ${ORB}. \`/stocks\` shows prices, \`/stock buy\` and \`/stock sell\` trade (${STOCK_FEE * 100}% fee each way), and \`/portfolio\` shows your profit or loss.\n\n` +
+      `If the data for a stock stops updating, trading on it pauses until it's back. Big moves are announced in the event channel.`
     );
   }
   if (topic === 'admin') {
@@ -2257,6 +2547,12 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       case 'use':
         return await handleUse(i);
+      case 'stocks':
+        return await handleStocks(i);
+      case 'stock':
+        return await handleStock(i);
+      case 'portfolio':
+        return await handlePortfolio(i);
       case 'inventory':
         return await handleInventory(i);
       case 'buy':
@@ -2359,6 +2655,8 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(() => dropTick().catch(console.error), 60 * 1000);
   setInterval(() => raidTick().catch(console.error), 60 * 1000);
   setInterval(() => seasonTick().catch(console.error), 60 * 1000);
+  stockTick().catch(console.error);
+  setInterval(() => stockTick().catch(console.error), STOCK_POLL_MINUTES * 60 * 1000);
 });
 
 client.login(TOKEN);
