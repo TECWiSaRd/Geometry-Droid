@@ -666,6 +666,23 @@ const withNotes = (text, notes) => (notes.length ? `${text}\n\n${notes.join('\n'
 
 const commands = [
   new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('How the bot works')
+    .addStringOption((o) =>
+      o
+        .setName('topic')
+        .setDescription('Jump to a topic')
+        .addChoices(
+          { name: 'Basics', value: 'start' },
+          { name: 'Earning', value: 'earning' },
+          { name: 'Shop', value: 'shop' },
+          { name: 'Progress', value: 'progress' },
+          { name: 'Clans', value: 'social' },
+          { name: 'Events', value: 'events' },
+          { name: 'Admin', value: 'admin' }
+        )
+    ),
+  new SlashCommandBuilder()
     .setName('balance')
     .setDescription('Check your mana orbs')
     .addUserOption((o) => o.setName('user').setDescription('Someone else')),
@@ -1832,6 +1849,111 @@ async function handleLotwButton(i) {
   });
 }
 
+/* ───────────── Help ───────────── */
+
+const HELP_TOPICS = {
+  start: '🟠 Basics',
+  earning: '🔨 Earning',
+  shop: '🛒 Shop',
+  progress: '⭐ Progress',
+  social: '🏰 Clans',
+  events: '🎉 Events',
+  admin: '🛠️ Admin',
+};
+
+const mins = (sec) => (sec >= 3600 ? `${sec / 3600}h` : `${sec / 60}m`);
+const scaled = (n) => fmt(Math.floor(n * payoutMultiplier()));
+
+// Built from the live settings so the numbers stay right when they're tuned.
+function helpText(topic) {
+  if (topic === 'earning') {
+    const lines = Object.entries(ACTIONS).map(
+      ([name, a]) => `\`/${name}\` (${mins(a.cooldown)}): ${scaled(a.min)}-${scaled(a.max)} ${ORB}, ${Math.round(a.bonusChance * 100)}% chance of x${a.bonusMult}`
+    );
+    return (
+      `${lines.join('\n')}\n\n` +
+      `**/quiz** is always a trivia question with ${TRIVIA_SECONDS}s to answer. Harder questions pay more (x${DIFF_MULT[1]} to x${DIFF_MULT[4]}), and you get ${QUIZ_SKIPS} skips to reroll a question.\n\n` +
+      `**/daily** pays once per UTC day. Claiming on back-to-back days builds a streak worth more, up to day ${DAILY_MAX_STREAK}.\n\n` +
+      `**Bot checks:** earn commands sometimes ask a quick question first. Answer in ${CHALLENGE_SECONDS}s (${TRIVIA_SECONDS}s for trivia) to get paid. ` +
+      `${MAX_FAILS} misses lock you out of earning for ${mins(LOCK_SECONDS)}.\n\n` +
+      `Payouts grow as the orb supply grows (\`/supply\`), so the numbers above go up over time.`
+    );
+  }
+  if (topic === 'shop') {
+    return (
+      `\`/shop\` lists items and \`/buy\` gets one. Prices rise slowly as the supply grows.\n\n` +
+      `**Tools:** the Diamond Pickaxe boosts \`/mine\` and the Good Fishing Rod boosts \`/fish\` by a random %. ` +
+      `\`/upgrade\` raises the top of that range, up to level ${MAX_TOOL_LEVEL}. Each level costs twice the last.\n\n` +
+      `**Salary boosts:** the Salary Raise (+5%) and Good Resumé (+25%) raise your role salary. You need a paid role, and only the best one counts.\n\n` +
+      `**Roles:** Image Permissions and Admin Permissions give you the matching server role.\n\n` +
+      `**/pay** sends orbs to someone. ${Math.round(PAY_TAX * 100)}% is taxed back into the vault.`
+    );
+  }
+  if (topic === 'progress') {
+    return (
+      `**Levels:** every orb you earn is XP. \`/level\` shows yours. At level ${MAX_LEVEL}, \`/prestige\` resets your level for a permanent ` +
+      `+${Math.round(PRESTIGE_BONUS * 100)}% on earn payouts (up to ${MAX_PRESTIGE} times). You keep your orbs and items.\n\n` +
+      `**Achievements:** \`/achievements\` lists ${ACHIEVEMENTS.length} goals, each paying a one-time reward.\n\n` +
+      `**Secret Coins:** every paid earn has a ${Math.round(COIN_CHANCE * 100)}% chance to turn up a coin. There are three per earn command. ` +
+      `\`/coins\` shows your collection, and completing a set pays a bonus.\n\n` +
+      `**Seasons:** each season lasts ${SEASON_DAYS} days. Playing earns season points, and the ${SEASON_TIERS.length}-tier season pass pays out as you climb. ` +
+      `The top 3 win prizes when the season ends. See \`/season\`.`
+    );
+  }
+  if (topic === 'social') {
+    return (
+      `\`/clan create\` founds a clan for ${fmt(clanPrice())} ${ORB} (up to ${CLAN_MAX_MEMBERS} members). The owner uses \`/clan invite\`, ` +
+      `and invited players use \`/clan join\` within ${CLAN_INVITE_DAYS} days.\n\n` +
+      `\`/clan deposit\` puts orbs into the clan's upgrade fund. Deposits **can't be withdrawn**. The owner spends the fund with \`/clan upgrade\`, ` +
+      `and each level (max ${CLAN_MAX_LEVEL}) gives every member +${Math.round(CLAN_BONUS * 100)}% on earn payouts.\n\n` +
+      `\`/clan info\` and \`/clan top\` show clans. If the owner leaves, the longest-standing member takes over.`
+    );
+  }
+  if (topic === 'events') {
+    return (
+      `**Orb drops:** an orb appears every ${DROP_MIN_MINUTES}-${DROP_MAX_MINUTES} minutes, and the first to click wins it. ` +
+      `After a win, you sit out the next ${DROP_WAIT} drops.\n\n` +
+      `**Raids:** a boss shows up every few days. Every earn command, \`/daily\` and drop win hits it. ` +
+      `Beat it within ${RAID_HOURS}h and the reward is split by damage. See \`/raid status\`.\n\n` +
+      `**Weekly challenge:** a server-wide goal that changes every Monday. Everyone who helps gets paid when it's done. See \`/weekly\`.\n\n` +
+      `**Tournaments:** moderators run trivia tournaments. Answer fast and right to win, and the top 3 split the prize.\n\n` +
+      `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it and you get paid by star rating.`
+    );
+  }
+  if (topic === 'admin') {
+    return (
+      `These need **Manage Server**:\n` +
+      `\`/salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
+      `\`/raid start\`: summon a raid boss in the current channel\n` +
+      `\`/tournament\`: run a trivia tournament in the current channel\n` +
+      `\`/lotw set|end\`: choose the Level of the Week. Review clears with the Approve and Reject buttons\n\n` +
+      `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`LOTW_REVIEW_CHANNEL_ID\` (clear reviews), ` +
+      `\`SEASON_ROLE_ID\` (season champion). See the README.`
+    );
+  }
+  return (
+    `Mana orbs ${ORB} are this server's currency. Earn them, level up, and spend them in the shop.\n\n` +
+    `**Start here**\n\`/daily\` claim free orbs every day\n\`/work\` \`/build\` \`/fish\` \`/mine\` \`/quiz\` earn orbs (each has a cooldown)\n` +
+    `\`/balance\` \`/leaderboard\` check orbs\n\`/shop\` \`/buy\` spend them\n\n` +
+    `Pick a topic below to learn more.`
+  );
+}
+
+const helpRows = (active) => {
+  const buttons = Object.entries(HELP_TOPICS).map(([key, label]) =>
+    new ButtonBuilder().setCustomId(`help:${key}`).setLabel(label).setStyle(key === active ? ButtonStyle.Primary : ButtonStyle.Secondary)
+  );
+  return [new ActionRowBuilder().addComponents(buttons.slice(0, 4)), new ActionRowBuilder().addComponents(buttons.slice(4))];
+};
+
+const helpPage = (topic) => ({
+  embeds: [embed(helpText(topic), `📖 Help: ${HELP_TOPICS[topic].replace(/^\S+ /, '')}`)],
+  components: helpRows(topic),
+});
+
+const handleHelp = (i) => i.reply({ ...helpPage(i.options.getString('topic') ?? 'start'), flags: EPH });
+const handleHelpButton = (i) => i.update(helpPage(HELP_TOPICS[i.customId.split(':')[1]] ? i.customId.split(':')[1] : 'start'));
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1950,7 +2072,9 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
-    const handler = { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton }[i.customId.split(':')[0]] ?? handleChallengeButton;
+    const handler =
+      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton }[i.customId.split(':')[0]] ??
+      handleChallengeButton;
     return handler(i).catch(console.error);
   }
   if (!i.isChatInputCommand()) return;
@@ -2027,6 +2151,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleSeason(i);
       case 'lotw':
         return await handleLotw(i);
+      case 'help':
+        return await handleHelp(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
