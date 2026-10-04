@@ -149,6 +149,22 @@ const ACTIONS = {
       'You mined in the Treasure Room with the Keymaster',
     ],
   },
+  quiz: {
+    emoji: '❓',
+    verb: 'answering Geometry Dash trivia',
+    cooldown: 3 * 60,
+    min: 100,
+    max: 300,
+    bonusChance: 0.05,
+    bonusMult: 3,
+    bonusText: 'Perfect recall!',
+    trivia: true, // always a trivia question, never math or symbols
+    lines: [
+      'You aced a Geometry Dash quiz',
+      'You knew the answer to a level history question',
+      'You remembered the official level order',
+    ],
+  },
 };
 
 /* ───────────── Database ───────────── */
@@ -299,7 +315,7 @@ const commands = [
   ...Object.keys(ACTIONS).map((name) =>
     new SlashCommandBuilder()
       .setName(name)
-      .setDescription(`${ACTIONS[name].emoji} Earn mana orbs by ${name === 'work' ? 'working' : name === 'build' ? 'building' : name === 'fish' ? 'fishing' : 'mining'}`)
+      .setDescription(`${ACTIONS[name].emoji} Earn mana orbs by ${ACTIONS[name].verb ?? { work: 'working', build: 'building', fish: 'fishing', mine: 'mining' }[name]}`)
   ),
   new SlashCommandBuilder()
     .setName('pay')
@@ -368,8 +384,8 @@ const SYMBOLS = [
   ['key', '🔑'], ['diamond', '💎'], ['skull', '💀'], ['fire', '🔥'],
 ];
 
-function makeChallenge() {
-  const kind = pick(['math', 'trivia', 'symbol']);
+function makeChallenge(kinds = ['math', 'trivia', 'symbol']) {
+  const kind = pick(kinds);
 
   if (kind === 'math') {
     const x = rand(3, 25);
@@ -419,7 +435,7 @@ const rewardEmbed = (uid, r) =>
   );
 
 async function sendChallenge(i, reward) {
-  const ch = makeChallenge();
+  const ch = makeChallenge(reward.trivia ? ['trivia'] : undefined);
   const id = Math.random().toString(36).slice(2, 10);
   const row = new ActionRowBuilder().addComponents(
     ch.options.map((label, n) =>
@@ -493,10 +509,10 @@ async function handleEarn(i, name) {
     amount *= a.bonusMult;
     bonus = `\n✨ **${a.bonusText}** (x${a.bonusMult})`;
   }
-  const reward = { name, amount, bonus, line: pick(a.lines) };
+  const reward = { name, amount, bonus, line: pick(a.lines), trivia: a.trivia };
 
   s.streak += 1;
-  if (Math.random() < CHALLENGE_CHANCE || s.streak >= FORCE_AFTER) {
+  if (a.trivia || Math.random() < CHALLENGE_CHANCE || s.streak >= FORCE_AFTER) {
     s.streak = 0;
     saveStrike(uid, s);
     q.setCd.run(uid, name, now); // cooldown starts now, orbs are paid only if solved
