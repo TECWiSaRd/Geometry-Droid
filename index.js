@@ -100,14 +100,20 @@ const LOTW_REWARD_PER_STAR = 2_000; // per star of the featured level; scales wi
 // Stocks follow real Geometry Dash stats, refreshed every STOCK_POLL_MINUTES.
 // Level stocks follow download momentum (GDBrowser): downloads in the last 24h vs the level's
 // average day over up to 7 days. Player stocks follow the player's Demonlist score (Pointercrate).
-const STOCKS = {
+// These are listed on first start; after that the list lives in the database, players propose
+// levels with /stock propose, and moderators approve, add or remove them.
+const DEFAULT_STOCKS = {
   BLD: { name: 'Bloodbath', kind: 'level', id: '10565740' },
   SNW: { name: 'Sonic Wave', kind: 'level', id: '26681070' },
   TDL: { name: 'Tidal Wave', kind: 'level', id: '86407629' },
   ACH: { name: 'Acheron', kind: 'level', id: '73667628' },
-  ZNK: { name: 'Zoink', kind: 'player', id: 53408 },
-  POP: { name: 'wPopoff', kind: 'player', id: 51613 },
+  ZNK: { name: 'Zoink', kind: 'player', id: '53408' },
+  POP: { name: 'wPopoff', kind: 'player', id: '51613' },
 };
+const STOCK_MAX = 20; // listed stocks at once (each is one GDBrowser request per update)
+const STOCK_MIN_DOWNLOADS = 1_000_000; // proposed levels need this many, so a few alts can't move the price
+const STOCK_WARMUP_HOURS = 36; // new listings collect data this long before trading opens
+const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID || LOTW_REVIEW_CHANNEL_ID; // where stock proposals go; also clears if LOTW_REVIEW_CHANNEL_ID isn't set
 const STOCK_BASE = 1_000; // price at a stock's usual level. Fixed, so holding doesn't ride payout growth for free
 const STOCK_RANGE = [0.25, 4]; // price floor and ceiling, as multiples of the base
 const STOCK_FEE = 0.02; // on buys and sells; goes back to the vault
@@ -405,6 +411,11 @@ CREATE TABLE IF NOT EXISTS item_uses (
   user_id TEXT NOT NULL, item TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
   PRIMARY KEY (user_id, item, day)
 );
+CREATE TABLE IF NOT EXISTS stocks (
+  sym TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
+  status TEXT NOT NULL, proposer TEXT, listed_at INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
+  UNIQUE (kind, ref_id)
+);
 CREATE TABLE IF NOT EXISTS stock_samples (sym TEXT NOT NULL, ts INTEGER NOT NULL, value REAL NOT NULL, PRIMARY KEY (sym, ts));
 CREATE TABLE IF NOT EXISTS stock_prices (sym TEXT NOT NULL, ts INTEGER NOT NULL, price INTEGER NOT NULL, PRIMARY KEY (sym, ts));
 CREATE TABLE IF NOT EXISTS holdings (
@@ -507,6 +518,18 @@ const q = {
   setBuff: db.prepare('INSERT OR REPLACE INTO buffs (user_id, buff, until) VALUES (?, ?, ?)'),
   getUses: db.prepare('SELECT n FROM item_uses WHERE user_id = ? AND item = ? AND day = ?'),
   addUse: db.prepare('INSERT INTO item_uses (user_id, item, day, n) VALUES (?, ?, ?, 1) ON CONFLICT(user_id, item, day) DO UPDATE SET n = n + 1'),
+  insertStock: db.prepare('INSERT INTO stocks (sym, name, kind, ref_id, status, proposer, listed_at, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+  stockBySym: db.prepare('SELECT * FROM stocks WHERE sym = ?'),
+  stockByRef: db.prepare('SELECT * FROM stocks WHERE kind = ? AND ref_id = ?'),
+  listedStocks: db.prepare("SELECT * FROM stocks WHERE status = 'listed' ORDER BY listed_at, sym"),
+  listedCount: db.prepare("SELECT COUNT(*) AS n FROM stocks WHERE status = 'listed'"),
+  pendingBy: db.prepare("SELECT sym FROM stocks WHERE status = 'pending' AND proposer = ?"),
+  approveStock: db.prepare("UPDATE stocks SET status = 'listed', listed_at = ? WHERE sym = ? AND status = 'pending'"),
+  delStock: db.prepare('DELETE FROM stocks WHERE sym = ?'),
+  holdersOf: db.prepare('SELECT user_id, shares FROM holdings WHERE sym = ? AND shares > 0'),
+  delHoldings: db.prepare('DELETE FROM holdings WHERE sym = ?'),
+  delSamples: db.prepare('DELETE FROM stock_samples WHERE sym = ?'),
+  delPrices: db.prepare('DELETE FROM stock_prices WHERE sym = ?'),
   addSample: db.prepare('INSERT OR REPLACE INTO stock_samples (sym, ts, value) VALUES (?, ?, ?)'),
   lastSample: db.prepare('SELECT ts, value FROM stock_samples WHERE sym = ? ORDER BY ts DESC LIMIT 1'),
   sampleBefore: db.prepare('SELECT ts, value FROM stock_samples WHERE sym = ? AND ts <= ? ORDER BY ts DESC LIMIT 1'),
@@ -608,6 +631,25 @@ const sellStockTx = db.transaction((uid, sym, shares, price) => {
   q.ensure.run(uid);
   q.refund.run(proceeds, uid);
   return { result: 'ok', proceeds, basis };
+});
+
+// Delisting pays every holder at the last price (shared out if the vault is short) and wipes the stock.
+const delistTx = db.transaction((sym, price) => {
+  const holders = q.holdersOf.all(sym);
+  const total = holders.reduce((n, h) => n + h.shares * price, 0);
+  const ratio = total > 0 ? Math.min(1, mintable() / total) : 1;
+  const paid = [];
+  for (const h of holders) {
+    const amt = Math.floor(h.shares * price * ratio);
+    if (amt > 0) {
+      q.ensure.run(h.user_id);
+      q.refund.run(amt, h.user_id);
+    }
+    paid.push([h.user_id, amt]);
+  }
+  for (const stmt of [q.delHoldings, q.delSamples, q.delPrices, q.delStock]) stmt.run(sym);
+  q.setMeta.run(`stock_base:${sym}`, '0');
+  return paid;
 });
 
 // Takes one from the inventory if the player has one and hasn't hit today's limit.
@@ -843,21 +885,40 @@ const commands = [
       s
         .setName('buy')
         .setDescription(`Buy shares (${STOCK_FEE * 100}% fee)`)
-        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
         .addIntegerOption((o) => o.setName('shares').setDescription('How many shares').setRequired(true).setMinValue(1).setMaxValue(1_000_000))
     )
     .addSubcommand((s) =>
       s
         .setName('sell')
         .setDescription(`Sell shares (${STOCK_FEE * 100}% fee)`)
-        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
         .addIntegerOption((o) => o.setName('shares').setDescription('How many shares (default: all)').setMinValue(1).setMaxValue(1_000_000))
     )
     .addSubcommand((s) =>
       s
         .setName('info')
         .setDescription('What a stock tracks and its recent prices')
-        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).addChoices(...stockChoices()))
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('propose')
+        .setDescription(`Suggest a level to list (needs ${fmt(STOCK_MIN_DOWNLOADS)}+ downloads; moderators approve)`)
+        .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('add')
+        .setDescription('List a level right away (Manage Server)')
+        .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
+        .addStringOption((o) => o.setName('symbol').setDescription('2-5 letters (default: made from the name)').setMinLength(2).setMaxLength(5))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('remove')
+        .setDescription('Delist a stock and pay holders the last price (Manage Server)')
+        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
     ),
   new SlashCommandBuilder()
     .setName('portfolio')
@@ -2031,7 +2092,8 @@ async function handleLotw(i) {
   }
   await i.deferReply({ flags: EPH });
 
-  const review = LOTW_REVIEW_CHANNEL_ID ? await client.channels.fetch(LOTW_REVIEW_CHANNEL_ID).catch(() => null) : i.channel;
+  const reviewId = LOTW_REVIEW_CHANNEL_ID || REVIEW_CHANNEL_ID;
+  const review = reviewId ? await client.channels.fetch(reviewId).catch(() => null) : i.channel;
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`lotw:approve:${row.id}`).setLabel('Approve').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`lotw:reject:${row.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
@@ -2077,8 +2139,80 @@ async function handleLotwButton(i) {
 
 /* ───────────── Stocks ───────────── */
 
-function stockChoices() {
-  return Object.entries(STOCKS).map(([sym, x]) => ({ name: `${sym} · ${x.name}`, value: sym }));
+// Seed the starting stocks once; after that moderators manage the list.
+if (!q.getMeta.get('stocks_seeded')) {
+  for (const [sym, x] of Object.entries(DEFAULT_STOCKS)) {
+    if (!q.stockBySym.get(sym)) q.insertStock.run(sym, x.name, x.kind, x.id, 'listed', null, 0, nowSec());
+  }
+  q.setMeta.run('stocks_seeded', '1');
+}
+
+const findStock = (sym) => (sym ? q.stockBySym.get(sym.trim().toUpperCase()) : undefined);
+const opensAt = (st) => st.listed_at + STOCK_WARMUP_HOURS * 3600;
+
+// Ticker from the level name: initials for several words, else the first letter plus consonants.
+function makeSymbol(name) {
+  const words = name.toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+  let sym = words.length > 1 ? words.map((w) => w[0]).join('').slice(0, 4) : '';
+  if (sym.length < 3) {
+    const flat = words.join('') || 'LVL';
+    sym = (flat[0] + flat.slice(1).replace(/[AEIOU]/g, '')).replace(/(.)\1+/g, '$1');
+    if (sym.length < 3) sym += flat.slice(1);
+    sym = sym.slice(0, 3);
+  }
+  if (!q.stockBySym.get(sym)) return sym;
+  for (let n = 2; n < 100; n++) if (!q.stockBySym.get(`${sym.slice(0, 3)}${n}`)) return `${sym.slice(0, 3)}${n}`;
+  return `L${Date.now() % 10000}`;
+}
+
+async function stockAutocomplete(i) {
+  const typed = i.options.getFocused().toUpperCase();
+  const matches = q.listedStocks
+    .all()
+    .filter((st) => st.sym.includes(typed) || st.name.toUpperCase().includes(typed))
+    .slice(0, 25)
+    .map((st) => ({ name: `${st.sym} · ${st.name}`, value: st.sym }));
+  return i.respond(matches);
+}
+
+// Looks a level up on GDBrowser and checks it can be listed.
+async function checkLevel(id) {
+  if (!/^\d{1,12}$/.test(id)) return { error: 'Level IDs are numbers, like \`10565740\`.' };
+  const existing = q.stockByRef.get('level', id);
+  if (existing) return { error: `That level is already ${existing.status === 'pending' ? 'waiting for approval' : `listed as **${existing.sym}**`}.` };
+  if (q.listedCount.get().n >= STOCK_MAX) return { error: `The market is full (${STOCK_MAX} stocks). A moderator has to remove one first.` };
+  const lvl = await fetchJson(`https://gdbrowser.com/api/level/${id}`).catch(() => null);
+  if (!lvl || typeof lvl.downloads !== 'number') return { error: "I couldn't find that level on the Geometry Dash servers." };
+  if (lvl.downloads < STOCK_MIN_DOWNLOADS) {
+    return { error: `**${lvl.name}** has ${fmt(lvl.downloads)} downloads. Listed levels need at least **${fmt(STOCK_MIN_DOWNLOADS)}**, so a few extra downloads can't move the price.` };
+  }
+  return { lvl };
+}
+
+async function announceListing(st) {
+  await announce(`**${st.sym}** (${st.name}) is now listed. It collects download data first, and trading opens <t:${opensAt(st)}:R>.`, '🔔 New stock');
+}
+
+async function handleStockButton(i) {
+  const [, action, sym] = i.customId.split(':');
+  if (!isMod(i)) return i.reply({ content: '❌ Only moderators (Manage Server) can review listings.', flags: EPH });
+  const st = q.stockBySym.get(sym);
+  if (!st || st.status !== 'pending') return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
+  if (st.proposer === i.user.id) return i.reply({ content: "❌ You can't review your own proposal.", flags: EPH });
+
+  if (action === 'reject') {
+    q.delStock.run(sym);
+    return i.update({ content: `<@${st.proposer}>, your proposal for **${st.name}** was not accepted.`, embeds: [embed(`Rejected by ${i.user}.`, '📈 Listing rejected')], components: [] });
+  }
+  if (q.listedCount.get().n >= STOCK_MAX) return i.reply({ content: `❌ The market is full (${STOCK_MAX}). Remove a stock with \`/stock remove\` first.`, flags: EPH });
+  if (q.approveStock.run(nowSec(), sym).changes === 0) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
+  const listed = q.stockBySym.get(sym);
+  announceListing(listed).catch(() => {});
+  return i.update({
+    content: `<@${st.proposer}>, your proposal was approved!`,
+    embeds: [embed(`Approved by ${i.user}. **${sym}** (${st.name}) opens for trading <t:${opensAt(listed)}:R>.`, '📈 Listing approved')],
+    components: [],
+  });
 }
 
 async function fetchJson(url) {
@@ -2118,16 +2252,18 @@ function playerRatio(sym, score) {
 // stock's price unchanged (and paused once it goes stale).
 async function stockTick() {
   const now = nowSec();
-  const anyPlayers = Object.values(STOCKS).some((x) => x.kind === 'player');
+  const list = q.listedStocks.all();
+  const anyPlayers = list.some((x) => x.kind === 'player');
   const ranking = anyPlayers ? await fetchJson('https://pointercrate.com/api/v1/players/ranking/?limit=100').catch((err) => {
     console.error('Demonlist fetch failed:', err.message);
     return null;
   }) : null;
 
   const moves = [];
-  for (const [sym, x] of Object.entries(STOCKS)) {
+  for (const x of list) {
+    const sym = x.sym;
     try {
-      const value = x.kind === 'level' ? (await fetchJson(`https://gdbrowser.com/api/level/${x.id}`)).downloads : ranking?.find((p) => p.id === x.id)?.score;
+      const value = x.kind === 'level' ? (await fetchJson(`https://gdbrowser.com/api/level/${x.ref_id}`)).downloads : ranking?.find((p) => String(p.id) === x.ref_id)?.score;
       if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('no data');
       q.addSample.run(sym, now, value);
       const ratio = x.kind === 'level' ? levelRatio(sym, now) : playerRatio(sym, value);
@@ -2178,23 +2314,87 @@ function dayChange(sym, price) {
 }
 
 async function handleStocks(i) {
-  const lines = Object.entries(STOCKS).map(([sym, x]) => {
+  const now = nowSec();
+  const lines = q.listedStocks.all().map((x) => {
+    const sym = x.sym;
     const last = q.lastPrice.get(sym);
+    if (now < opensAt(x)) return `**${sym}** ${x.name} — 🕒 new listing, trading opens <t:${opensAt(x)}:R>`;
     if (!last) return `**${sym}** ${x.name} — waiting for data`;
     const live = livePrice(sym);
     const change = dayChange(sym, last.price);
     return `**${sym}** ${x.name} — **${fmt(last.price)}** ${ORB} ${change ? `(${change} 24h)` : ''} ${sparkline(sym, nowSec() - DAY_SECONDS)}${live ? '' : ' ⏸️ paused'}`;
   });
   return i.reply({
-    embeds: [embed(`${lines.join('\n')}\n\nPrices follow real GD stats and update every ${STOCK_POLL_MINUTES} min. \`/stock info\` explains each one.`, '📈 Stock market')],
+    embeds: [embed(`${lines.join('\n')}\n\nPrices follow real GD stats and update every ${STOCK_POLL_MINUTES} min. \`/stock info\` explains each one, and \`/stock propose\` suggests a new level.`, '📈 Stock market')],
   });
 }
 
 async function handleStock(i) {
   const sub = i.options.getSubcommand();
-  const sym = i.options.getString('symbol');
-  const x = STOCKS[sym];
   const uid = i.user.id;
+
+  if (sub === 'propose' || sub === 'add') {
+    if (sub === 'add' && !isMod(i)) return fail(i, 'You need Manage Server for that. Use \`/stock propose\` instead.');
+    if (sub === 'propose' && q.pendingBy.get(uid)) return fail(i, 'You already have a proposal waiting for review.');
+    const custom = i.options.getString('symbol')?.trim().toUpperCase() ?? null;
+    if (custom && !/^[A-Z][A-Z0-9]{1,4}$/.test(custom)) return fail(i, 'Symbols are 2-5 letters or numbers, starting with a letter.');
+    if (custom && q.stockBySym.get(custom)) return fail(i, `**${custom}** is already taken.`);
+    await i.deferReply({ flags: EPH });
+    const id = i.options.getString('level_id').trim();
+    const { lvl, error } = await checkLevel(id);
+    if (error) return fail(i, error);
+    const sym = custom ?? makeSymbol(lvl.name);
+    const name = String(lvl.name).slice(0, 40);
+    const now = nowSec();
+
+    if (sub === 'add') {
+      q.insertStock.run(sym, name, 'level', id, 'listed', uid, now, now);
+      const st = q.stockBySym.get(sym);
+      await announceListing(st);
+      return i.editReply({ content: `📈 Listed **${sym}** (${name}). Trading opens <t:${opensAt(st)}:R>.` });
+    }
+
+    q.insertStock.run(sym, name, 'level', id, 'pending', uid, 0, now);
+    const review = REVIEW_CHANNEL_ID ? await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null) : i.channel;
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`stk:approve:${sym}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`stk:reject:${sym}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
+    );
+    const posted = await review
+      ?.send({
+        embeds: [
+          embed(
+            `${i.user} wants to list **${name}** by ${lvl.author} (ID \`${id}\`) as **${sym}**.\n` +
+              `Downloads: **${fmt(lvl.downloads)}** · Likes: **${fmt(lvl.likes ?? 0)}** · ${lvl.difficulty ?? 'Unknown'}\n\n` +
+              `If approved, it collects data for ${STOCK_WARMUP_HOURS}h before trading opens. Moderators can pick their own symbol with \`/stock add\` instead.`,
+            '📈 Stock proposal'
+          ),
+        ],
+        components: [row],
+      })
+      .catch(() => null);
+    if (!posted) {
+      q.delStock.run(sym);
+      return fail(i, "I couldn't post your proposal for review (check my permissions in the review channel). Try again later.");
+    }
+    return i.editReply({ content: `📨 Proposed **${name}** as **${sym}**. A moderator will review it.` });
+  }
+
+  const x = findStock(i.options.getString('symbol'));
+  if (!x || x.status !== 'listed') return fail(i, "That stock isn't listed. See \`/stocks\`.");
+  const sym = x.sym;
+
+  if (sub === 'remove') {
+    if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
+    const last = q.lastPrice.get(sym)?.price ?? STOCK_BASE;
+    const paid = delistTx(sym, last);
+    const total = paid.reduce((n, [, a]) => n + a, 0);
+    const text = paid.length
+      ? `**${sym}** (${x.name}) was delisted. **${paid.length}** holder${paid.length === 1 ? ' was' : 's were'} paid **${fmt(total)}** ${ORB} in total at **${fmt(last)}** per share.`
+      : `**${sym}** (${x.name}) was delisted. Nobody held any shares.`;
+    announce(text, '🔕 Stock delisted').catch(() => {});
+    return i.reply({ embeds: [embed(text, '🔕 Stock delisted')] });
+  }
 
   if (sub === 'info') {
     const last = q.lastPrice.get(sym);
@@ -2203,7 +2403,7 @@ async function handleStock(i) {
     if (x.kind === 'level') {
       const dayAgo = q.sampleBefore.get(sym, nowSec() - DAY_SECONDS);
       const recent = sample && dayAgo ? `\nDownloads in the last 24h: **${fmt(Math.round(sample.value - dayAgo.value))}**` : '\nBuilding up 24h of download history.';
-      detail = `Tracks how much **${x.name}** (level ID \`${x.id}\`) is being played: downloads in the last 24h vs its average day.\nTotal downloads: **${sample ? fmt(Math.round(sample.value)) : '?'}**${recent}`;
+      detail = `Tracks how much **${x.name}** (level ID \`${x.ref_id}\`) is being played: downloads in the last 24h vs its average day.\nTotal downloads: **${sample ? fmt(Math.round(sample.value)) : '?'}**${recent}`;
     } else {
       detail = `Tracks **${x.name}**'s Demonlist score on Pointercrate.\nCurrent score: **${sample ? sample.value.toFixed(2) : '?'}**`;
     }
@@ -2213,6 +2413,7 @@ async function handleStock(i) {
     return i.reply({ embeds: [embed(`${detail}\n\nPrice: ${price}${week ? `\n7 days: ${week}` : ''}${paused}`, `📈 ${sym} · ${x.name}`)] });
   }
 
+  if (nowSec() < opensAt(x)) return fail(i, `**${sym}** is a new listing. Trading opens <t:${opensAt(x)}:R>, once it has enough download history.`);
   const price = livePrice(sym);
   if (!price) return fail(i, `Trading on **${sym}** is paused until fresh data arrives. Try again soon.`);
 
@@ -2338,13 +2539,15 @@ function helpText(topic) {
     );
   }
   if (topic === 'stocks') {
-    const levels = Object.entries(STOCKS).filter(([, x]) => x.kind === 'level').map(([sym, x]) => `**${sym}** ${x.name}`).join(', ');
-    const players = Object.entries(STOCKS).filter(([, x]) => x.kind === 'player').map(([sym, x]) => `**${sym}** ${x.name}`).join(', ');
+    const list = q.listedStocks.all();
+    const levels = list.filter((x) => x.kind === 'level').map((x) => `**${x.sym}** ${x.name}`).join(', ') || 'none yet';
+    const players = list.filter((x) => x.kind === 'player').map((x) => `**${x.sym}** ${x.name}`).join(', ') || 'none';
     return (
       `Stocks move with real Geometry Dash stats, updated every ${STOCK_POLL_MINUTES} minutes.\n\n` +
       `**Level stocks** (${levels}) rise when the level gets played more than usual. The price compares its downloads in the last 24h with its average day.\n\n` +
       `**Player stocks** (${players}) follow that player's Demonlist score, so they jump when the player beats a new demon.\n\n` +
       `A stock at its usual level is worth about **${fmt(STOCK_BASE)}** ${ORB}. \`/stocks\` shows prices, \`/stock buy\` and \`/stock sell\` trade (${STOCK_FEE * 100}% fee each way), and \`/portfolio\` shows your profit or loss.\n\n` +
+      `**Want another level?** \`/stock propose level_id\` suggests any level with ${fmt(STOCK_MIN_DOWNLOADS)}+ downloads. If a moderator approves it, it trades after ${STOCK_WARMUP_HOURS}h of data.\n\n` +
       `If the data for a stock stops updating, trading on it pauses until it's back. Big moves are announced in the event channel.`
     );
   }
@@ -2354,8 +2557,9 @@ function helpText(topic) {
       `\`/salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
       `\`/raid start\`: summon a raid boss in the current channel\n` +
       `\`/tournament\`: run a trivia tournament in the current channel\n` +
-      `\`/lotw set|end\`: choose the Level of the Week. Review clears with the Approve and Reject buttons\n\n` +
-      `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`LOTW_REVIEW_CHANNEL_ID\` (clear reviews), ` +
+      `\`/lotw set|end\`: choose the Level of the Week. Review clears with the Approve and Reject buttons\n` +
+      `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). Review player proposals with the buttons\n\n` +
+      `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`REVIEW_CHANNEL_ID\` (stock proposals and clears), ` +
       `\`SEASON_ROLE_ID\` (season champion). See the README.`
     );
   }
@@ -2501,10 +2705,11 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
     const handler =
-      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton }[i.customId.split(':')[0]] ??
+      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton }[i.customId.split(':')[0]] ??
       handleChallengeButton;
     return handler(i).catch(console.error);
   }
+  if (i.isAutocomplete()) return stockAutocomplete(i).catch(console.error);
   if (!i.isChatInputCommand()) return;
   if (!i.inGuild()) return fail(i, 'Use me in a server.');
 
