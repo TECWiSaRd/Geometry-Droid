@@ -51,6 +51,12 @@ const DROP_MIN_MINUTES = 20;
 const DROP_MAX_MINUTES = 40;
 const DROP_EXPIRE_SECONDS = 10 * 60;
 const DROP_WAIT = 5; // drops you must sit out after winning one
+const CLAN_PRICE = 25_000; // to found a clan; scales like shop prices
+const CLAN_MAX_MEMBERS = 20;
+const CLAN_MAX_LEVEL = 5;
+const CLAN_BONUS = 0.01; // +1% earn payouts per clan level, for every member
+const CLAN_UPGRADE_BASE = 50_000; // level L -> L+1 costs this x 3^L; scales like shop prices
+const CLAN_INVITE_DAYS = 7;
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -205,6 +211,7 @@ const ACHIEVEMENTS = [
   { key: 'demon_brain', name: '😈 Demon Brain', desc: 'Answer 10 four-star quiz questions', stat: 'quiz_hard', goal: 10, reward: 4_000 },
   { key: 'quick_hands', name: '⚡ Quick Hands', desc: 'Win 5 orb drops', stat: 'drop', goal: 5, reward: 2_500 },
   { key: 'dedicated', name: '📅 Dedicated', desc: 'Reach a 30-day /daily streak', stat: 'daily_streak', goal: 30, reward: 10_000 },
+  { key: 'founder', name: '🏰 Founder', desc: 'Found a clan', stat: 'clan_founded', goal: 1, reward: 1_000 },
 ];
 
 /* ───────────── Database ───────────── */
@@ -258,6 +265,21 @@ CREATE TABLE IF NOT EXISTS achievements (
   user_id TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL,
   PRIMARY KEY (user_id, key)
 );
+CREATE TABLE IF NOT EXISTS clans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE, owner_id TEXT NOT NULL,
+  treasury INTEGER NOT NULL DEFAULT 0, level INTEGER NOT NULL DEFAULT 0,
+  contributed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
+  UNIQUE (guild_id, name)
+);
+CREATE TABLE IF NOT EXISTS clan_members (
+  user_id TEXT PRIMARY KEY, clan_id INTEGER NOT NULL, joined INTEGER NOT NULL,
+  contributed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS clan_invites (
+  clan_id INTEGER NOT NULL, user_id TEXT NOT NULL, ts INTEGER NOT NULL,
+  PRIMARY KEY (clan_id, user_id)
+);
 `);
 
 const q = {
@@ -295,6 +317,23 @@ const q = {
   setStat: db.prepare('INSERT OR REPLACE INTO stats (user_id, key, n) VALUES (?, ?, ?)'),
   addAch: db.prepare('INSERT OR IGNORE INTO achievements (user_id, key, ts) VALUES (?, ?, ?)'),
   userAchs: db.prepare('SELECT key FROM achievements WHERE user_id = ?'),
+  clanOf: db.prepare('SELECT c.* FROM clan_members m JOIN clans c ON c.id = m.clan_id WHERE m.user_id = ?'),
+  clanByName: db.prepare('SELECT * FROM clans WHERE guild_id = ? AND name = ?'),
+  newClan: db.prepare('INSERT INTO clans (guild_id, name, owner_id, created) VALUES (?, ?, ?, ?)'),
+  delClan: db.prepare('DELETE FROM clans WHERE id = ?'),
+  delClanInvites: db.prepare('DELETE FROM clan_invites WHERE clan_id = ?'),
+  setClanOwner: db.prepare('UPDATE clans SET owner_id = ? WHERE id = ?'),
+  addMember: db.prepare('INSERT INTO clan_members (user_id, clan_id, joined) VALUES (?, ?, ?)'),
+  delMember: db.prepare('DELETE FROM clan_members WHERE user_id = ?'),
+  clanMembers: db.prepare('SELECT user_id, contributed FROM clan_members WHERE clan_id = ? ORDER BY joined, rowid'),
+  clanSize: db.prepare('SELECT COUNT(*) AS n FROM clan_members WHERE clan_id = ?'),
+  addInvite: db.prepare('INSERT OR REPLACE INTO clan_invites (clan_id, user_id, ts) VALUES (?, ?, ?)'),
+  getInvite: db.prepare('SELECT ts FROM clan_invites WHERE clan_id = ? AND user_id = ?'),
+  delInvite: db.prepare('DELETE FROM clan_invites WHERE clan_id = ? AND user_id = ?'),
+  clanDeposit: db.prepare('UPDATE clans SET treasury = treasury + ?, contributed = contributed + ? WHERE id = ?'),
+  memberDeposit: db.prepare('UPDATE clan_members SET contributed = contributed + ? WHERE user_id = ?'),
+  clanLevelUp: db.prepare('UPDATE clans SET treasury = treasury - @cost, level = level + 1 WHERE id = @id AND treasury >= @cost AND level < @max'),
+  topClans: db.prepare('SELECT * FROM clans WHERE guild_id = ? ORDER BY level DESC, contributed DESC LIMIT 10'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -365,6 +404,50 @@ const undoBuyTx = db.transaction((uid, key, price) => {
   q.refund.run(price, uid);
 });
 
+const createClanTx = db.transaction((uid, guildId, name, price, now) => {
+  if (q.clanOf.get(uid)) return 'inclan';
+  if (q.clanByName.get(guildId, name)) return 'taken';
+  q.ensure.run(uid);
+  if (getBalance(uid) < price) return 'poor';
+  q.sub.run(price, uid);
+  const id = q.newClan.run(guildId, name, uid, now).lastInsertRowid;
+  q.addMember.run(uid, id, now);
+  return 'ok';
+});
+
+const joinClanTx = db.transaction((uid, clan, now) => {
+  if (q.clanOf.get(uid)) return 'inclan';
+  const invite = q.getInvite.get(clan.id, uid);
+  if (!invite || now - invite.ts > CLAN_INVITE_DAYS * DAY_SECONDS) return 'noinvite';
+  if (q.clanSize.get(clan.id).n >= CLAN_MAX_MEMBERS) return 'full';
+  q.addMember.run(uid, clan.id, now);
+  q.delInvite.run(clan.id, uid);
+  return 'ok';
+});
+
+// The longest-standing member takes over when the owner leaves; an empty clan is disbanded.
+const leaveClanTx = db.transaction((uid, clan) => {
+  q.delMember.run(uid);
+  if (clan.owner_id !== uid) return { result: 'left' };
+  const next = q.clanMembers.all(clan.id)[0];
+  if (!next) {
+    q.delClanInvites.run(clan.id);
+    q.delClan.run(clan.id);
+    return { result: 'disbanded' };
+  }
+  q.setClanOwner.run(next.user_id, clan.id);
+  return { result: 'transferred', owner: next.user_id };
+});
+
+// Deposits can't be withdrawn, so a clan can't be used to dodge the /pay tax.
+const depositTx = db.transaction((uid, clanId, amount) => {
+  if (getBalance(uid) < amount) return false;
+  q.sub.run(amount, uid);
+  q.clanDeposit.run(amount, amount, clanId);
+  q.memberDeposit.run(amount, uid);
+  return true;
+});
+
 const payoutTx = db.transaction((payouts) => {
   const total = payouts.reduce((n, [, a]) => n + a, 0);
   const avail = mintable();
@@ -413,6 +496,9 @@ const upgradeCost = (key, level) => Math.ceil(priceOf(key) * 2 ** level);
 const levelOf = (xp) => Math.min(MAX_LEVEL, Math.floor(Math.sqrt(xp / XP_BASE)) + 1);
 const progressOf = (uid) => q.getProg.get(uid) ?? { xp: 0, prestige: 0 };
 const prestigeBonus = (uid) => progressOf(uid).prestige * PRESTIGE_BONUS;
+const clanBonus = (uid) => (q.clanOf.get(uid)?.level ?? 0) * CLAN_BONUS;
+const clanPrice = () => Math.ceil(CLAN_PRICE * priceMult());
+const clanUpgradeCost = (level) => Math.ceil(CLAN_UPGRADE_BASE * 3 ** level * priceMult());
 
 /* ───────────── Stats, achievements and play hooks ───────────── */
 
@@ -489,6 +575,36 @@ const commands = [
     ),
   new SlashCommandBuilder().setName('changelog').setDescription('Show the latest update to the bot'),
   new SlashCommandBuilder().setName('level').setDescription('See your level, XP and prestige'),
+  new SlashCommandBuilder()
+    .setName('clan')
+    .setDescription('Team up with other players')
+    .addSubcommand((s) =>
+      s
+        .setName('create')
+        .setDescription('Found a clan')
+        .addStringOption((o) => o.setName('name').setDescription('Letters, numbers and spaces').setRequired(true).setMinLength(3).setMaxLength(24))
+    )
+    .addSubcommand((s) =>
+      s.setName('invite').setDescription('Invite a player (owner only)').addUserOption((o) => o.setName('user').setDescription('Who to invite').setRequired(true))
+    )
+    .addSubcommand((s) =>
+      s.setName('join').setDescription('Join a clan that invited you').addStringOption((o) => o.setName('name').setDescription('Clan name').setRequired(true))
+    )
+    .addSubcommand((s) => s.setName('leave').setDescription('Leave your clan'))
+    .addSubcommand((s) =>
+      s.setName('kick').setDescription('Remove a member (owner only)').addUserOption((o) => o.setName('user').setDescription('Who to remove').setRequired(true))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('deposit')
+        .setDescription('Put orbs into the clan upgrade fund (cannot be withdrawn)')
+        .addIntegerOption((o) => o.setName('amount').setDescription('Orbs to deposit').setRequired(true).setMinValue(1))
+    )
+    .addSubcommand((s) => s.setName('upgrade').setDescription('Spend the fund on the next clan level (owner only)'))
+    .addSubcommand((s) =>
+      s.setName('info').setDescription('See a clan').addStringOption((o) => o.setName('name').setDescription('Clan name (default: yours)'))
+    )
+    .addSubcommand((s) => s.setName('top').setDescription('Top clans')),
   new SlashCommandBuilder()
     .setName('achievements')
     .setDescription('See unlocked achievements and progress')
@@ -747,7 +863,7 @@ async function handleEarn(i, name) {
     const level = item.perk?.action === name ? toolLevel(uid, key) : 0;
     if (level) amount = Math.floor(amount * (1 + rand(item.perk.min, item.perk.max + item.perk.step * (level - 1)) / 100));
   }
-  amount = Math.floor(amount * (1 + prestigeBonus(uid)));
+  amount = Math.floor(amount * (1 + prestigeBonus(uid) + clanBonus(uid)));
   let bonus = '';
   if (Math.random() < a.bonusChance) {
     amount *= a.bonusMult;
@@ -904,6 +1020,120 @@ async function handleAchievements(i) {
     return `⬜ **${a.name}** — ${a.desc} (${fmt(n)}/${fmt(a.goal)})`;
   });
   return i.reply({ embeds: [embed(lines.join('\n'), `🏅 ${user.username}: ${owned.size}/${ACHIEVEMENTS.length} achievements`)] });
+}
+
+/* ───────────── Clans ───────────── */
+
+const CLAN_NAME = /^[A-Za-z0-9][A-Za-z0-9 '_-]{1,22}[A-Za-z0-9]$/;
+
+function clanInfoEmbed(clan) {
+  const members = q.clanMembers.all(clan.id);
+  const next = clan.level < CLAN_MAX_LEVEL ? `Next level: **${fmt(clanUpgradeCost(clan.level))}** ${ORB}` : 'Max level';
+  const list = members.map((m) => `${m.user_id === clan.owner_id ? '👑' : '•'} <@${m.user_id}> — ${fmt(m.contributed)} ${ORB} deposited`).join('\n');
+  return embed(
+    `Level **${clan.level}** / ${CLAN_MAX_LEVEL} (earn payouts +${Math.round(clan.level * CLAN_BONUS * 100)}% for every member)\n` +
+      `Upgrade fund: **${fmt(clan.treasury)}** ${ORB} · ${next}\n` +
+      `Members: **${members.length}** / ${CLAN_MAX_MEMBERS}\n\n${list}`,
+    `🏰 ${clan.name}`
+  );
+}
+
+async function handleClan(i) {
+  const sub = i.options.getSubcommand();
+  const uid = i.user.id;
+  const now = nowSec();
+  const mine = q.clanOf.get(uid);
+  const ownerOnly = () => (!mine ? "You're not in a clan." : mine.owner_id !== uid ? 'Only the clan owner can do that.' : null);
+
+  if (sub === 'create') {
+    const name = i.options.getString('name').trim().replace(/\s+/g, ' ');
+    if (!CLAN_NAME.test(name)) return fail(i, 'Clan names are 3-24 characters: letters, numbers, spaces, `-`, `_` or `\'`.');
+    const price = clanPrice();
+    const result = createClanTx(uid, i.guildId, name, price, now);
+    if (result === 'inclan') return fail(i, `You're already in **${mine.name}**. Leave it first.`);
+    if (result === 'taken') return fail(i, 'A clan with that name already exists.');
+    if (result === 'poor') return fail(i, `Founding a clan costs **${fmt(price)}** ${ORB} but you only have **${fmt(getBalance(uid))}**.`);
+    const notes = [];
+    bumpStat(uid, 'clan_founded', 1, notes);
+    return i.reply({ embeds: [embed(withNotes(`You founded **${name}** for **${fmt(price)}** ${ORB}. Invite players with \`/clan invite\`.`, notes), '🏰 Clan founded')] });
+  }
+
+  if (sub === 'invite') {
+    const err = ownerOnly();
+    if (err) return fail(i, err);
+    const target = i.options.getUser('user');
+    if (target.bot || target.id === uid) return fail(i, 'Pick another real player.');
+    if (q.clanOf.get(target.id)) return fail(i, `${target} is already in a clan.`);
+    if (q.clanSize.get(mine.id).n >= CLAN_MAX_MEMBERS) return fail(i, 'Your clan is full.');
+    q.addInvite.run(mine.id, target.id, now);
+    return i.reply({ content: `${target}, you've been invited to **${mine.name}**. Use \`/clan join name:${mine.name}\` within ${CLAN_INVITE_DAYS} days.` });
+  }
+
+  if (sub === 'join') {
+    const clan = q.clanByName.get(i.guildId, i.options.getString('name').trim());
+    if (!clan) return fail(i, 'No clan has that name.');
+    const result = joinClanTx(uid, clan, now);
+    if (result === 'inclan') return fail(i, `You're already in **${mine.name}**. Leave it first.`);
+    if (result === 'noinvite') return fail(i, `You need an invite from the owner of **${clan.name}**.`);
+    if (result === 'full') return fail(i, `**${clan.name}** is full.`);
+    return i.reply({ embeds: [embed(`${i.user} joined **${clan.name}**.`, '🏰 New member')] });
+  }
+
+  if (sub === 'leave') {
+    if (!mine) return fail(i, "You're not in a clan.");
+    const r = leaveClanTx(uid, mine);
+    const text = {
+      left: `You left **${mine.name}**.`,
+      transferred: `You left **${mine.name}**. <@${r.owner}> is the new owner.`,
+      disbanded: `You left **${mine.name}**. It had no other members, so it was disbanded and its upgrade fund is gone.`,
+    }[r.result];
+    return i.reply({ embeds: [embed(text, '🏰 Left clan')] });
+  }
+
+  if (sub === 'kick') {
+    const err = ownerOnly();
+    if (err) return fail(i, err);
+    const target = i.options.getUser('user');
+    if (target.id === uid) return fail(i, 'Use `/clan leave` to leave your own clan.');
+    if (q.clanOf.get(target.id)?.id !== mine.id) return fail(i, `${target} isn't in your clan.`);
+    q.delMember.run(target.id);
+    return i.reply({ embeds: [embed(`${target} was removed from **${mine.name}**.`, '🏰 Member removed')] });
+  }
+
+  if (sub === 'deposit') {
+    if (!mine) return fail(i, "You're not in a clan.");
+    const amount = i.options.getInteger('amount');
+    if (!depositTx(uid, mine.id, amount)) return fail(i, `You only have **${fmt(getBalance(uid))}** ${ORB}.`);
+    return i.reply({
+      embeds: [embed(`${i.user} put **${fmt(amount)}** ${ORB} into **${mine.name}**'s upgrade fund (now **${fmt(mine.treasury + amount)}** ${ORB}).`, '🏰 Deposit')],
+    });
+  }
+
+  if (sub === 'upgrade') {
+    const err = ownerOnly();
+    if (err) return fail(i, err);
+    if (mine.level >= CLAN_MAX_LEVEL) return fail(i, `**${mine.name}** is already max level.`);
+    const cost = clanUpgradeCost(mine.level);
+    if (q.clanLevelUp.run({ cost, id: mine.id, max: CLAN_MAX_LEVEL }).changes === 0) {
+      return fail(i, `The next level costs **${fmt(cost)}** ${ORB} but the fund only has **${fmt(mine.treasury)}**.`);
+    }
+    const level = mine.level + 1;
+    return i.reply({ embeds: [embed(`**${mine.name}** is now level **${level}**. Every member earns +${Math.round(level * CLAN_BONUS * 100)}% on earn commands.`, '🏰 Clan upgraded')] });
+  }
+
+  if (sub === 'info') {
+    const name = i.options.getString('name');
+    const clan = name ? q.clanByName.get(i.guildId, name.trim()) : mine;
+    if (!clan) return fail(i, name ? 'No clan has that name.' : "You're not in a clan. Name one to look it up.");
+    return i.reply({ embeds: [clanInfoEmbed(clan)] });
+  }
+
+  const rows = q.topClans.all(i.guildId);
+  const medals = ['🥇', '🥈', '🥉'];
+  const text = rows.length
+    ? rows.map((c, n) => `${medals[n] ?? `**${n + 1}.**`} **${c.name}** — level ${c.level}, ${fmt(c.contributed)} ${ORB} deposited, ${q.clanSize.get(c.id).n} members`).join('\n')
+    : 'No clans yet. Found one with `/clan create`.';
+  return i.reply({ embeds: [embed(text, '🏆 Top clans')] });
 }
 
 /* ───────────── Orb drops ───────────── */
@@ -1087,6 +1317,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleLevel(i);
       case 'achievements':
         return await handleAchievements(i);
+      case 'clan':
+        return await handleClan(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
