@@ -2175,26 +2175,30 @@ async function handleLotw(i) {
   return i.editReply({ content: '📨 Proof sent to the moderators. You will be paid when it is approved.' });
 }
 
+// Review buttons acknowledge the click first: the permission check can need a lookup on Discord,
+// and the click has to be answered within 3 seconds.
 async function handleLotwButton(i) {
+  await i.deferUpdate();
+  const deny = (msg) => i.followUp({ content: `❌ ${msg}`, flags: EPH });
   const [, action, id] = i.customId.split(':');
   const pending = q.subById.get(Number(id));
-  if (!pending) return i.reply({ content: '❌ That submission no longer exists.', flags: EPH });
-  if (!(await canReview(i, pending.guild_id))) return i.reply({ content: '❌ Only moderators (Manage Server) can review clears.', flags: EPH });
-  if (pending.user_id === i.user.id) return i.reply({ content: "❌ You can't review your own clear.", flags: EPH });
+  if (!pending) return deny('That submission no longer exists.');
+  if (!(await canReview(i, pending.guild_id))) return deny('Only moderators (Manage Server) can review clears.');
+  if (pending.user_id === i.user.id) return deny("You can't review your own clear.");
 
   const row = q.reviewClear.get({ status: action === 'approve' ? 'approved' : 'rejected', reviewer: i.user.id, id: Number(id) });
-  if (!row) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
+  if (!row) return deny('Someone already reviewed this one.');
 
   if (action !== 'approve') {
     const done = { content: '', embeds: [embed(`<@${row.user_id}>'s clear was rejected by ${i.user}.`, '🎮 Clear rejected')], components: [] };
-    await i.update(done);
+    await i.editReply(done);
     await closeReviews('lotw', id, done, i.message?.id);
     return tellPlayer(row.user_id, 'Your Level of the Week clear was not accepted. You can send new proof with `/lotw submit`.', '🎮 Clear rejected');
   }
   const granted = mintTx(row.user_id, lotwReward(row.stars));
   const notes = afterEarn(row.user_id, row.guild_id, ['lotw'], granted);
   const done = { content: '', embeds: [embed(`<@${row.user_id}>'s clear was approved by ${i.user}. They earned **${fmt(granted)}** ${ORB}.`, '🎮 Clear verified')], components: [] };
-  await i.update(done);
+  await i.editReply(done);
   await closeReviews('lotw', id, done, i.message?.id);
   return tellPlayer(row.user_id, withNotes(`Your Level of the Week clear was verified! You earned **${fmt(granted)}** ${ORB}.`, notes), '🎮 Clear verified');
 }
@@ -2256,25 +2260,27 @@ async function announceListing(st) {
 }
 
 async function handleStockButton(i) {
+  await i.deferUpdate(); // see handleLotwButton
+  const deny = (msg) => i.followUp({ content: `❌ ${msg}`, flags: EPH });
   const [, action, sym, guildId] = i.customId.split(':');
-  if (!(await canReview(i, guildId))) return i.reply({ content: '❌ Only moderators (Manage Server) can review listings.', flags: EPH });
+  if (!(await canReview(i, guildId))) return deny('Only moderators (Manage Server) can review listings.');
   const st = q.stockBySym.get(sym);
-  if (!st || st.status !== 'pending') return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
-  if (st.proposer === i.user.id) return i.reply({ content: "❌ You can't review your own proposal.", flags: EPH });
+  if (!st || st.status !== 'pending') return deny('Someone already reviewed this one.');
+  if (st.proposer === i.user.id) return deny("You can't review your own proposal.");
 
   if (action === 'reject') {
     q.delStock.run(sym);
     const done = { content: '', embeds: [embed(`<@${st.proposer}>'s proposal for **${st.name}** was rejected by ${i.user}.`, '📈 Listing rejected')], components: [] };
-    await i.update(done);
+    await i.editReply(done);
     await closeReviews('stock', sym, done, i.message?.id);
     return tellPlayer(st.proposer, `Your proposal to list **${st.name}** was not accepted.`, '📈 Listing rejected');
   }
-  if (q.listedCount.get().n >= STOCK_MAX) return i.reply({ content: `❌ The market is full (${STOCK_MAX}). Remove a stock with \`/stock remove\` first.`, flags: EPH });
-  if (q.approveStock.run(nowSec(), sym).changes === 0) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
+  if (q.listedCount.get().n >= STOCK_MAX) return deny(`The market is full (${STOCK_MAX}). Remove a stock with \`/stock remove\` first.`);
+  if (q.approveStock.run(nowSec(), sym).changes === 0) return deny('Someone already reviewed this one.');
   const listed = q.stockBySym.get(sym);
   announceListing(listed).catch(() => {});
   const done = { content: '', embeds: [embed(`**${sym}** (${st.name}) was approved by ${i.user}. Trading opens <t:${opensAt(listed)}:R>.`, '📈 Listing approved')], components: [] };
-  await i.update(done);
+  await i.editReply(done);
   await closeReviews('stock', sym, done, i.message?.id);
   return tellPlayer(st.proposer, `Your proposal was approved! **${sym}** (${st.name}) opens for trading <t:${opensAt(listed)}:R>.`, '📈 Listing approved');
 }
@@ -2769,7 +2775,11 @@ client.on(Events.InteractionCreate, async (i) => {
     const handler =
       { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton }[i.customId.split(':')[0]] ??
       handleChallengeButton;
-    return handler(i).catch(console.error);
+    return handler(i).catch(async (err) => {
+      console.error(err);
+      const msg = { content: '❌ Something broke. Try again.', flags: EPH };
+      await (i.deferred || i.replied ? i.followUp(msg) : i.reply(msg)).catch(() => {});
+    });
   }
   if (i.isAutocomplete()) return stockAutocomplete(i).catch(console.error);
   if (!i.isChatInputCommand()) return;
