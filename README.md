@@ -5,8 +5,11 @@ Geometry Dash themed Discord economy bot.
 ## Commands
 - `/balance [user]`, `/leaderboard`
 - `/work` (5m), `/build` (10m), `/fish` (3m), `/mine` (15m): earn orbs, with rare bonus rolls
-- `/quiz` (3m): answer a Geometry Dash trivia question within 30s to earn 200-500 orbs (always a challenge; wrong answers count as fails)
-- `/pay user amount`
+- `/quiz` (3m): answer a Geometry Dash trivia question within 10s. Base 200-500 orbs, scaled by question difficulty (0.5x to 3x). Up to 3 skips reroll the question. Always a challenge; wrong answers count as fails
+- `/pay user amount`: 10% tax (rounded up) goes back to the vault; transfers must be at least 2 orbs
+- `/daily`: claim once per UTC day; consecutive days raise the reward (max bonus at day 10)
+- `/upgrade tool`: Diamond Pickaxe and Good Fishing Rod go up to level 5, raising the random payout bonus and costing more each level
+- `/level`, `/prestige`: earn XP from your payouts. Reach level 50 to prestige, which resets XP for +2% payouts per prestige (max 10)
 - `/shop`, `/buy item`: Image Permissions (1,000), Admin Permissions (1 trillion), Salary Raise (20,000, +5% salary), Good Resumé (500,000, +25% salary), Diamond Pickaxe (5,000, +2-10% mining), Good Fishing Rod (4,000, +2-15% fishing)
 - `/salary set|remove|list` (Manage Server): automatic role payments
 
@@ -46,6 +49,9 @@ Circulation is capped at 500,000,000 orbs on launch day, and the cap grows linea
 ## Salaries
 Example: `/salary set @Owner 50000`, `/salary set @Admin 20000`, `/salary set @Mod 5000`. Everyone with the role is paid every `SALARY_INTERVAL_MINUTES`. If someone has several paid roles they get the highest one only.
 
+## Orb drops
+Set `DROP_CHANNEL_ID` to a channel and the bot posts an orb drop every 20-40 minutes. The first person to click "Grab it!" wins. Golden Orbs (about 1 in 7) pay 5x. After winning, you must sit out the next 5 drops before you can win again. Unclaimed drops expire after 10 minutes. The bot needs View Channel and Send Messages in that channel. Live drops are closed out on restart.
+
 ## Tweaking
-Edit `SHOP` and `ACTIONS` at the top of `index.js` for prices, cooldowns, payouts and flavor text.
+Edit `SHOP` and `ACTIONS` at the top of `index.js` for prices, cooldowns, payouts and flavor text. Shop prices rise 4% per doubling of the supply cap (`PRICE_SCALE`), so they grow much more slowly than payouts.
 

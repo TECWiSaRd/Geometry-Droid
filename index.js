@@ -33,11 +33,32 @@ const TARGET_SUPPLY = 2_000_000_000_000;
 const SUPPLY_DAYS = 180;
 const DAILY_ADD = (TARGET_SUPPLY - START_SUPPLY) / SUPPLY_DAYS; // ~11.1 billion/day
 const SCALE_PAYOUTS = true; // earn payouts grow with the supply so the economy keeps up
+const PRICE_SCALE = 0.04; // shop prices gain 4% per doubling of the supply cap (2T cap ≈ +48%)
+
+const PAY_TAX = 0.1; // share of each /pay removed from circulation (back into the vault)
+const DAILY_BASE = 500;
+const DAILY_STEP = 100; // extra per streak day
+const DAILY_MAX_STREAK = 10; // streak bonus stops growing after this many days
+const DAY_SECONDS = 24 * 60 * 60; // /daily resets at UTC midnight
+const MAX_TOOL_LEVEL = 5;
+const MAX_LEVEL = 50;
+const XP_BASE = 500; // level L begins at XP_BASE * (L-1)^2 xp
+const MAX_PRESTIGE = 10;
+const PRESTIGE_BONUS = 0.02; // +2% earn payouts per prestige
+const DROP_CHANNEL_ID = process.env.DROP_CHANNEL_ID; // optional: where orb drops appear
+const DROP_BASE = 1000;
+const DROP_MIN_MINUTES = 20;
+const DROP_MAX_MINUTES = 40;
+const DROP_EXPIRE_SECONDS = 10 * 60;
+const DROP_WAIT = 5; // drops you must sit out after winning one
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
 const FORCE_AFTER = 10; // always check after this many earns without one
 const CHALLENGE_SECONDS = 30; // time to answer
+const TRIVIA_SECONDS = 10; // trivia questions are quick reads
+const QUIZ_SKIPS = 3; // skips per /quiz, each one rerolls the question
+const DIFF_MULT = { 1: 0.5, 2: 1, 3: 2, 4: 3 }; // /quiz payout by question difficulty
 const MAX_FAILS = 3; // fails before lockout
 const LOCK_SECONDS = 60 * 60; // lockout length
 
@@ -72,21 +93,22 @@ const SHOP = {
   },
   diamond_pickaxe: {
     name: '💎 Diamond Pickaxe',
-    desc: '+2-10% (random) on every /mine payout.',
+    desc: 'Random +2-10% on every /mine payout. Each /upgrade raises the top of the range by 5%.',
     price: 5_000,
-    perk: { action: 'mine', min: 2, max: 10 },
+    perk: { action: 'mine', min: 2, max: 10, step: 5 },
   },
   good_rod: {
     name: '🎣 Good Fishing Rod',
-    desc: '+2-15% (random) on every /fish payout.',
+    desc: 'Random +2-15% on every /fish payout. Each /upgrade raises the top of the range by 5%.',
     price: 4_000,
-    perk: { action: 'fish', min: 2, max: 15 },
+    perk: { action: 'fish', min: 2, max: 15, step: 5 },
   },
 };
 
 const ACTIONS = {
   work: {
     emoji: '🔨',
+    verb: 'working',
     cooldown: 5 * 60,
     min: 80,
     max: 200,
@@ -103,6 +125,7 @@ const ACTIONS = {
   },
   build: {
     emoji: '🧱',
+    verb: 'building',
     cooldown: 10 * 60,
     min: 150,
     max: 400,
@@ -119,6 +142,7 @@ const ACTIONS = {
   },
   fish: {
     emoji: '🎣',
+    verb: 'fishing',
     cooldown: 3 * 60,
     min: 40,
     max: 150,
@@ -135,6 +159,7 @@ const ACTIONS = {
   },
   mine: {
     emoji: '⛏️',
+    verb: 'mining',
     cooldown: 15 * 60,
     min: 200,
     max: 600,
@@ -197,6 +222,19 @@ CREATE TABLE IF NOT EXISTS strikes (
   streak INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tools (
+  user_id TEXT NOT NULL, tool TEXT NOT NULL, level INTEGER NOT NULL,
+  PRIMARY KEY (user_id, tool)
+);
+CREATE TABLE IF NOT EXISTS daily (
+  user_id TEXT PRIMARY KEY, last_day INTEGER NOT NULL, streak INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS progress (
+  user_id TEXT PRIMARY KEY, xp INTEGER NOT NULL DEFAULT 0, prestige INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS drop_wins (
+  user_id TEXT PRIMARY KEY, seq INTEGER NOT NULL
+);
 `);
 
 const q = {
@@ -219,6 +257,15 @@ const q = {
   circ: db.prepare('SELECT COALESCE(SUM(balance), 0) AS s FROM users'),
   getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
   setMeta: db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'),
+  getTool: db.prepare('SELECT level FROM tools WHERE user_id = ? AND tool = ?'),
+  setTool: db.prepare('INSERT OR REPLACE INTO tools (user_id, tool, level) VALUES (?, ?, ?)'),
+  getDaily: db.prepare('SELECT last_day, streak FROM daily WHERE user_id = ?'),
+  setDaily: db.prepare('INSERT OR REPLACE INTO daily (user_id, last_day, streak) VALUES (?, ?, ?)'),
+  getProg: db.prepare('SELECT xp, prestige FROM progress WHERE user_id = ?'),
+  addXp: db.prepare('INSERT INTO progress (user_id, xp, prestige) VALUES (?, ?, 0) ON CONFLICT(user_id) DO UPDATE SET xp = xp + excluded.xp'),
+  resetXp: db.prepare('UPDATE progress SET xp = 0, prestige = prestige + 1 WHERE user_id = ?'),
+  getWin: db.prepare('SELECT seq FROM drop_wins WHERE user_id = ?'),
+  setWin: db.prepare('INSERT OR REPLACE INTO drop_wins (user_id, seq) VALUES (?, ?)'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -235,12 +282,18 @@ const supplyCap = () =>
 const circulating = () => q.circ.get().s;
 const mintable = () => Math.max(0, supplyCap() - circulating());
 const payoutMultiplier = () => (SCALE_PAYOUTS ? Math.max(1, supplyCap() / START_SUPPLY) : 1);
+// Prices rise only slowly with the cap, unlike payouts which scale linearly.
+const priceMult = () => 1 + PRICE_SCALE * Math.log2(Math.max(1, supplyCap() / START_SUPPLY));
+const priceOf = (key) => Math.ceil(SHOP[key].price * priceMult());
 
 // Orbs can only be minted while circulation is below the cap. Returns what was actually granted.
 const mintTx = db.transaction((uid, amount) => {
   q.ensure.run(uid);
   const granted = Math.max(0, Math.min(amount, mintable()));
-  if (granted > 0) q.add.run(granted, granted, uid);
+  if (granted > 0) {
+    q.add.run(granted, granted, uid);
+    q.addXp.run(uid, granted);
+  }
   return granted;
 });
 
@@ -249,13 +302,24 @@ const earnTx = db.transaction((uid, action, amount, now) => {
   return mintTx(uid, amount);
 });
 
+// Returns the amount the receiver got (after tax), 0 if the tax would eat the whole transfer,
+// or false if the sender is short. Tax rounds up so small transfers can't dodge it.
 const transferTx = db.transaction((from, to, amount) => {
   q.ensure.run(from);
   q.ensure.run(to);
   if (getBalance(from) < amount) return false;
-  q.sub.run(amount, from);
-  q.add.run(amount, amount, to);
-  return true;
+  const received = amount - Math.ceil(amount * PAY_TAX);
+  if (received <= 0) return 0;
+  q.sub.run(amount, from); // the tax is never credited to anyone, so it goes back to the vault
+  q.refund.run(received, to);
+  return received;
+});
+
+const upgradeTx = db.transaction((uid, key, cost, level) => {
+  if (getBalance(uid) < cost) return 'poor';
+  q.sub.run(cost, uid);
+  q.setTool.run(uid, key, level + 1);
+  return 'ok';
 });
 
 const buyTx = db.transaction((uid, key, price, now) => {
@@ -281,6 +345,7 @@ const payoutTx = db.transaction((payouts) => {
     if (amt <= 0) continue;
     q.ensure.run(uid);
     q.add.run(amt, amt, uid);
+    q.addXp.run(uid, amt);
   }
 });
 
@@ -295,7 +360,10 @@ const embed = (desc, title) => {
   if (title) e.setTitle(title);
   return e;
 };
-const fail = (i, msg) => i.reply({ content: `❌ ${msg}`, flags: EPH });
+const fail = (i, msg) => {
+  const payload = { content: `❌ ${msg}` };
+  return i.deferred || i.replied ? i.editReply(payload) : i.reply({ ...payload, flags: EPH });
+};
 
 // Salary boosts don't stack: the best owned one applies.
 const salaryBoost = (uid) =>
@@ -304,6 +372,18 @@ const salaryBoost = (uid) =>
 // True if the member holds any role that has a /salary payout in this guild.
 const hasPaidSalary = (member, guildId) =>
   q.salaries.all(guildId).some((r) => member.roles.cache.has(r.role_id));
+
+// Tools bought before upgrades existed have no tools row, so they count as level 1.
+const toolLevel = (uid, key) => q.getTool.get(uid, key)?.level ?? (q.hasItem.get(uid, key) ? 1 : 0);
+const toolRange = (key, level) => {
+  const p = SHOP[key].perk;
+  return `+${p.min}-${p.max + p.step * (level - 1)}%`;
+};
+const upgradeCost = (key, level) => Math.ceil(priceOf(key) * 2 ** level);
+
+const levelOf = (xp) => Math.min(MAX_LEVEL, Math.floor(Math.sqrt(xp / XP_BASE)) + 1);
+const progressOf = (uid) => q.getProg.get(uid) ?? { xp: 0, prestige: 0 };
+const prestigeBonus = (uid) => progressOf(uid).prestige * PRESTIGE_BONUS;
 
 /* ───────────── Commands ───────────── */
 
@@ -315,7 +395,7 @@ const commands = [
   ...Object.keys(ACTIONS).map((name) =>
     new SlashCommandBuilder()
       .setName(name)
-      .setDescription(`${ACTIONS[name].emoji} Earn mana orbs by ${ACTIONS[name].verb ?? { work: 'working', build: 'building', fish: 'fishing', mine: 'mining' }[name]}`)
+      .setDescription(`${ACTIONS[name].emoji} Earn mana orbs by ${ACTIONS[name].verb}`)
   ),
   new SlashCommandBuilder()
     .setName('pay')
@@ -335,6 +415,19 @@ const commands = [
         .addChoices(...Object.entries(SHOP).map(([value, s]) => ({ name: s.name, value })))
     ),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Richest players'),
+  new SlashCommandBuilder().setName('daily').setDescription('Claim your daily orbs. Keep a streak for bigger rewards'),
+  new SlashCommandBuilder()
+    .setName('upgrade')
+    .setDescription('Upgrade a tool for a bigger payout')
+    .addStringOption((o) =>
+      o
+        .setName('tool')
+        .setDescription('Which tool')
+        .setRequired(true)
+        .addChoices(...Object.entries(SHOP).filter(([, s]) => s.perk).map(([value, s]) => ({ name: s.name, value })))
+    ),
+  new SlashCommandBuilder().setName('level').setDescription('See your level, XP and prestige'),
+  new SlashCommandBuilder().setName('prestige').setDescription(`Reset your level for a permanent payout bonus (needs level ${MAX_LEVEL})`),
   new SlashCommandBuilder()
     .setName('salary')
     .setDescription('Manage automatic role payments')
@@ -355,8 +448,6 @@ const commands = [
     .addSubcommand((s) => s.setName('list').setDescription('Show role payouts')),
 ].map((c) => c.toJSON());
 
-/* ───────────── Handlers ───────────── */
-
 /* ───────────── Anti-bot challenges ───────────── */
 
 const pending = new Map(); // challengeId -> { userId, reward, answer, timer }
@@ -371,12 +462,55 @@ const shuffle = (arr) => {
 };
 
 const TRIVIA = [
-  { q: 'Which is the first official Geometry Dash level?', a: 'Stereo Madness', w: ['Back On Track', 'Polargeist', 'Dry Out', 'Base After Base'] },
-  { q: 'Which is the second official level?', a: 'Back On Track', w: ['Stereo Madness', 'Polargeist', 'Dry Out', 'Base After Base'] },
-  { q: 'Which is the third official level?', a: 'Polargeist', w: ['Stereo Madness', 'Back On Track', 'Dry Out', 'Base After Base'] },
-  { q: 'Who created Geometry Dash?', a: 'RobTop', w: ['Zobros', 'Riot', 'Sailent', 'Hinds'] },
-  { q: 'Which game mode flies like a rocket?', a: 'Ship', w: ['Cube', 'Ball', 'Wave', 'Robot'] },
-  { q: 'Which game mode zig-zags diagonally?', a: 'Wave', w: ['Cube', 'Ship', 'Ball', 'UFO'] },
+  // difficulty 1
+  { q: 'Which is the first official Geometry Dash level?', a: 'Stereo Madness', w: ['Back On Track', 'Polargeist', 'Dry Out'], d: 1 },
+  { q: 'Who created Geometry Dash?', a: 'RobTop', w: ['Zobros', 'Riot', 'Hinds'], d: 1 },
+  { q: 'Which game mode flies like a rocket?', a: 'Ship', w: ['Cube', 'Ball', 'Wave'], d: 1 },
+  { q: 'Which game mode zig-zags diagonally?', a: 'Wave', w: ['Cube', 'Ship', 'Ball'], d: 1 },
+  { q: 'Which game mode is a bouncing sphere?', a: 'Ball', w: ['Cube', 'Ship', 'Robot'], d: 1 },
+  { q: 'Which game mode is a flying saucer?', a: 'UFO', w: ['Cube', 'Ship', 'Spider'], d: 1 },
+  { q: 'Which game mode runs on legs?', a: 'Robot', w: ['Cube', 'Ship', 'Wave'], d: 1 },
+  { q: 'Which is the default icon mode?', a: 'Cube', w: ['Ship', 'Ball', 'Robot'], d: 1 },
+  { q: 'Which portal makes you go faster?', a: 'Speed Portal', w: ['Mirror Portal', 'Mini Portal', 'Dual Portal'], d: 1 },
+  { q: 'Which portal makes your icon smaller?', a: 'Mini Portal', w: ['Speed Portal', 'Mirror Portal', 'Dual Portal'], d: 1 },
+  { q: 'What is the second official level?', a: 'Back On Track', w: ['Stereo Madness', 'Polargeist', 'Dry Out'], d: 1 },
+  { q: 'Which portal flips gravity?', a: 'Gravity Portal', w: ['Speed Portal', 'Mini Portal', 'Dual Portal'], d: 1 },
+  { q: 'Which portal lets two icons play at once?', a: 'Dual Portal', w: ['Mirror Portal', 'Mini Portal', 'Speed Portal'], d: 1 },
+  { q: 'Which hazard is a spike you must avoid?', a: 'Spike', w: ['Saw Blade', 'Jump Pad', 'Portal'], d: 1 },
+  { q: 'Which object launches you upward when you touch it?', a: 'Jump Pad', w: ['Spike', 'Saw Blade', 'Portal'], d: 1 },
+  { q: 'Which hazard is a spinning blade?', a: 'Saw Blade', w: ['Spike', 'Jump Pad', 'Mini Portal'], d: 1 },
+  // difficulty 2
+  { q: 'Which mode teleports between ceiling and floor when you tap?', a: 'Spider', w: ['Robot', 'Ship', 'UFO'], d: 2 },
+  { q: 'What is the third official level?', a: 'Polargeist', w: ['Stereo Madness', 'Back On Track', 'Dry Out'], d: 2 },
+  { q: 'What is the fourth official level?', a: 'Dry Out', w: ['Stereo Madness', 'Polargeist', 'Base After Base'], d: 2 },
+  { q: 'What is the fifth official level?', a: 'Base After Base', w: ['Dry Out', 'Can\'t Let Go', 'Jumper'], d: 2 },
+  { q: 'Which orb gives you an extra jump in mid-air?', a: 'Yellow Jump Orb', w: ['Pink Jump Orb', 'Red Jump Orb', 'Green Dash Orb'], d: 2 },
+  { q: 'Which portal mirrors the level?', a: 'Mirror Portal', w: ['Speed Portal', 'Mini Portal', 'Dual Portal'], d: 2 },
+  { q: 'What do you collect in levels to unlock secret rewards?', a: 'Secret Coins', w: ['Gold Keys', 'Diamonds', 'Stars'], d: 2 },
+  { q: 'Which company publishes Geometry Dash?', a: 'RobTop Games', w: ['Riot Games', 'Zobros', 'Hinds Studios'], d: 2 },
+  { q: 'Which trigger shakes the screen?', a: 'Shake Trigger', w: ['Pulse Trigger', 'Alpha Trigger', 'Move Trigger'], d: 2 },
+  { q: 'Which trigger moves objects?', a: 'Move Trigger', w: ['Color Trigger', 'Alpha Trigger', 'Pulse Trigger'], d: 2 },
+  { q: 'Which trigger changes the background color?', a: 'Color Trigger', w: ['Move Trigger', 'Alpha Trigger', 'Pulse Trigger'], d: 2 },
+  { q: 'Which orb gives you a dash?', a: 'Green Dash Orb', w: ['Yellow Jump Orb', 'Pink Jump Orb', 'Red Jump Orb'], d: 2 },
+  { q: 'Which trigger rotates objects?', a: 'Rotate Trigger', w: ['Shake Trigger', 'Move Trigger', 'Color Trigger'], d: 2 },
+  { q: 'Which trigger makes objects follow the player?', a: 'Follow Trigger', w: ['Move Trigger', 'Shake Trigger', 'Pulse Trigger'], d: 2 },
+  { q: 'Which portal turns you into a rolling ball?', a: 'Ball Portal', w: ['Ship Portal', 'Wave Portal', 'UFO Portal'], d: 2 },
+  { q: 'Which portal turns you into a robot?', a: 'Robot Portal', w: ['Spider Portal', 'Wave Portal', 'UFO Portal'], d: 2 },
+  { q: 'Which portal turns you into a spider?', a: 'Spider Portal', w: ['Robot Portal', 'Wave Portal', 'UFO Portal'], d: 2 },
+  // difficulty 3
+  { q: 'What is the sixth official level?', a: 'Can\'t Let Go', w: ['Base After Base', 'Jumper', 'Time Machine'], d: 3 },
+  { q: 'What is the seventh official level?', a: 'Jumper', w: ['Can\'t Let Go', 'Time Machine', 'Cycles'], d: 3 },
+  { q: 'In what year was Geometry Dash first released?', a: '2013', w: ['2011', '2014', '2016'], d: 3 },
+  { q: 'Which trigger changes an object\'s opacity?', a: 'Alpha Trigger', w: ['Pulse Trigger', 'Toggle Trigger', 'Color Trigger'], d: 3 },
+  { q: 'Which trigger makes objects pulse in color?', a: 'Pulse Trigger', w: ['Alpha Trigger', 'Toggle Trigger', 'Move Trigger'], d: 3 },
+  { q: 'Which trigger shows or hides groups?', a: 'Toggle Trigger', w: ['Alpha Trigger', 'Pulse Trigger', 'Spawn Trigger'], d: 3 },
+  { q: 'Which trigger spawns a group when activated?', a: 'Spawn Trigger', w: ['Toggle Trigger', 'Stop Trigger', 'Pulse Trigger'], d: 3 },
+  { q: 'Which trigger stops other effects?', a: 'Stop Trigger', w: ['Spawn Trigger', 'Toggle Trigger', 'Pulse Trigger'], d: 3 },
+  { q: 'Which trigger reacts when the player touches it?', a: 'Touch Trigger', w: ['Stop Trigger', 'Spawn Trigger', 'Toggle Trigger'], d: 3 },
+  // difficulty 4
+  { q: 'Which trigger counts activations instantly?', a: 'Instant Count Trigger', w: ['Spawn Trigger', 'Stop Trigger', 'Random Trigger'], d: 4 },
+  { q: 'Which trigger picks one of several groups at random?', a: 'Random Trigger', w: ['Spawn Trigger', 'Stop Trigger', 'Touch Trigger'], d: 4 },
+  { q: 'What is RobTop\'s real name?', a: 'Robert Topala', w: ['Robert Johnson', 'Robin Topal', 'Robert Taylor'], d: 4 },
 ];
 
 const SYMBOLS = [
@@ -384,7 +518,7 @@ const SYMBOLS = [
   ['key', '🔑'], ['diamond', '💎'], ['skull', '💀'], ['fire', '🔥'],
 ];
 
-function makeChallenge(kinds = ['math', 'trivia', 'symbol']) {
+function makeChallenge(kinds = ['math', 'trivia', 'symbol'], avoid = null) {
   const kind = pick(kinds);
 
   if (kind === 'math') {
@@ -401,9 +535,9 @@ function makeChallenge(kinds = ['math', 'trivia', 'symbol']) {
   }
 
   if (kind === 'trivia') {
-    const t = pick(TRIVIA);
+    const t = pick(avoid ? TRIVIA.filter((x) => x !== avoid) : TRIVIA);
     const options = shuffle([t.a, ...shuffle(t.w).slice(0, 3)]);
-    return { prompt: t.q, options, answer: options.indexOf(t.a) };
+    return { prompt: t.q, options, answer: options.indexOf(t.a), trivia: true, difficulty: t.d, question: t };
   }
 
   const [name, emoji] = pick(SYMBOLS);
@@ -434,28 +568,61 @@ const rewardEmbed = (uid, r) =>
     `${ACTIONS[r.name].emoji} /${r.name}`
   );
 
-async function sendChallenge(i, reward) {
-  const ch = makeChallenge(reward.trivia ? ['trivia'] : undefined);
-  const id = Math.random().toString(36).slice(2, 10);
-  const row = new ActionRowBuilder().addComponents(
-    ch.options.map((label, n) =>
-      new ButtonBuilder().setCustomId(`ch:${id}:${n}`).setLabel(label).setStyle(ButtonStyle.Secondary)
-    )
-  );
+// Puts a freshly rolled challenge into a pending entry. Quiz questions also set the payout by difficulty.
+function applyChallenge(p, ch) {
+  p.prompt = ch.prompt;
+  p.options = ch.options;
+  p.answer = ch.answer;
+  p.question = ch.question ?? null;
+  p.difficulty = ch.difficulty ?? null;
+  p.seconds = ch.trivia ? TRIVIA_SECONDS : CHALLENGE_SECONDS;
+  if (p.reward.trivia && ch.difficulty) p.reward.amount = Math.floor(p.reward.base * DIFF_MULT[ch.difficulty]);
+}
 
-  const entry = { userId: i.user.id, reward, answer: ch.answer, timer: null };
-  entry.timer = setTimeout(() => {
+function armTimer(id, p) {
+  p.timer = setTimeout(() => {
     if (!pending.delete(id)) return;
-    const lockedUntil = recordFail(i.user.id);
+    const lockedUntil = recordFail(p.userId);
     const extra = lockedUntil ? `\n🔒 Too many fails. Locked <t:${lockedUntil}:R>.` : '';
-    i.editReply({ embeds: [embed(`⏰ Too slow, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] }).catch(() => {});
-  }, CHALLENGE_SECONDS * 1000);
-  pending.set(id, entry);
+    p.origin.editReply({ embeds: [embed(`⏰ Too slow, no orbs this time.${extra}`, '🤖 Bot check failed')], components: [] }).catch(() => {});
+  }, p.seconds * 1000);
+}
 
-  return i.reply({
-    embeds: [embed(`${ch.prompt}\n\nAnswer within **${CHALLENGE_SECONDS}s** to claim **${fmt(reward.amount)}** ${ORB}`, '🤖 Bot check')],
-    components: [row],
-  });
+const challengeEmbed = (p) => {
+  let text = `${p.prompt}\n\n`;
+  if (p.reward.trivia && p.difficulty) text += `Difficulty ${'★'.repeat(p.difficulty)} (x${DIFF_MULT[p.difficulty]})\n`;
+  text += `Answer within **${p.seconds}s** to claim **${fmt(p.reward.amount)}** ${ORB}`;
+  if (p.reward.trivia) text += `\nSkips left: **${p.skipsLeft}**`;
+  return embed(text, p.reward.trivia ? '❓ Quiz' : '🤖 Bot check');
+};
+
+const challengeRow = (id, p) => {
+  const buttons = p.options.map((label, n) =>
+    new ButtonBuilder().setCustomId(`ch:${id}:${n}`).setLabel(label).setStyle(ButtonStyle.Secondary)
+  );
+  if (p.reward.trivia && p.skipsLeft > 0) {
+    buttons.push(new ButtonBuilder().setCustomId(`ch:${id}:skip`).setLabel('Skip').setStyle(ButtonStyle.Primary));
+  }
+  return new ActionRowBuilder().addComponents(buttons);
+};
+
+async function sendChallenge(i, reward) {
+  const id = Math.random().toString(36).slice(2, 10);
+  const p = { userId: i.user.id, origin: i, reward, skipsLeft: reward.trivia ? QUIZ_SKIPS : 0, timer: null };
+  applyChallenge(p, makeChallenge(reward.trivia ? ['trivia'] : undefined));
+  armTimer(id, p);
+  pending.set(id, p);
+
+  return i.reply({ embeds: [challengeEmbed(p)], components: [challengeRow(id, p)] });
+}
+
+async function skipQuestion(i, id, p) {
+  if (p.skipsLeft <= 0) return i.reply({ content: '❌ No skips left.', flags: EPH });
+  p.skipsLeft -= 1;
+  clearTimeout(p.timer);
+  applyChallenge(p, makeChallenge(['trivia'], p.question));
+  armTimer(id, p);
+  return i.update({ embeds: [challengeEmbed(p)], components: [challengeRow(id, p)] });
 }
 
 async function handleChallengeButton(i) {
@@ -464,6 +631,7 @@ async function handleChallengeButton(i) {
   const p = pending.get(id);
   if (!p) return i.reply({ content: '❌ That check expired.', flags: EPH });
   if (p.userId !== i.user.id) return i.reply({ content: "❌ This isn't your check.", flags: EPH });
+  if (n === 'skip') return skipQuestion(i, id, p);
 
   pending.delete(id);
   clearTimeout(p.timer);
@@ -501,15 +669,17 @@ async function handleEarn(i, name) {
   if (now < readyAt) return fail(i, `${a.emoji} You can /${name} again <t:${readyAt}:R>.`);
 
   let amount = Math.floor(rand(a.min, a.max) * payoutMultiplier());
-  for (const [key, s] of Object.entries(SHOP)) {
-    if (s.perk?.action === name && q.hasItem.get(uid, key)) amount = Math.floor(amount * (1 + rand(s.perk.min, s.perk.max) / 100));
+  for (const [key, item] of Object.entries(SHOP)) {
+    const level = item.perk?.action === name ? toolLevel(uid, key) : 0;
+    if (level) amount = Math.floor(amount * (1 + rand(item.perk.min, item.perk.max + item.perk.step * (level - 1)) / 100));
   }
+  amount = Math.floor(amount * (1 + prestigeBonus(uid)));
   let bonus = '';
   if (Math.random() < a.bonusChance) {
     amount *= a.bonusMult;
     bonus = `\n✨ **${a.bonusText}** (x${a.bonusMult})`;
   }
-  const reward = { name, amount, bonus, line: pick(a.lines), trivia: a.trivia };
+  const reward = { name, amount, base: amount, bonus, line: pick(a.lines), trivia: a.trivia };
 
   s.streak += 1;
   if (a.trivia || Math.random() < CHALLENGE_CHANCE || s.streak >= FORCE_AFTER) {
@@ -527,8 +697,10 @@ async function handleEarn(i, name) {
 }
 
 async function handleBuy(i) {
+  // Role grants can be slow, so acknowledge now to stay inside Discord's 3-second window.
+  await i.deferReply({ flags: EPH });
   const key = i.options.getString('item');
-  const item = SHOP[key];
+  const item = { ...SHOP[key], price: priceOf(key) };
   const uid = i.user.id;
   const roleId = item.roleEnv ? process.env[item.roleEnv] : null;
   if (item.roleEnv && !roleId) return fail(i, `${item.name} isn't set up yet. An admin needs to set \`${item.roleEnv}\`.`);
@@ -553,7 +725,7 @@ async function handleBuy(i) {
       return fail(i, "I couldn't give you the role (check my permissions and role order). You were refunded.");
     }
   }
-  return i.reply({
+  return i.editReply({
     embeds: [embed(`You bought **${item.name}** for **${fmt(item.price)}** ${ORB}\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '🛒 Purchase complete')],
   });
 }
@@ -580,12 +752,161 @@ async function handleSalary(i) {
   return i.reply({ embeds: [embed(`${text}\n\nPaid every ${SALARY_INTERVAL_MIN} min. Members with several paid roles get the highest one.`, '💼 Role salaries')] });
 }
 
+/* ───────────── Daily, tools, levels ───────────── */
+
+async function handleDaily(i) {
+  const uid = i.user.id;
+  const today = Math.floor(nowSec() / DAY_SECONDS);
+  const d = q.getDaily.get(uid);
+  if (d && d.last_day >= today) {
+    return fail(i, `You already claimed today. Next claim <t:${(today + 1) * DAY_SECONDS}:R>.`);
+  }
+  const streak = d && d.last_day === today - 1 ? d.streak + 1 : 1;
+  const amount = Math.floor((DAILY_BASE + DAILY_STEP * Math.min(streak - 1, DAILY_MAX_STREAK - 1)) * payoutMultiplier());
+  const granted = mintTx(uid, amount);
+  if (granted <= 0) return i.reply({ embeds: [embed('The orb vault is empty right now. Try again later.', '🏦 Vault empty')] });
+  q.setDaily.run(uid, today, streak);
+  const note = streak >= DAILY_MAX_STREAK ? ' (max streak bonus)' : '';
+  return i.reply({
+    embeds: [embed(`You claimed **${fmt(granted)}** ${ORB}\nStreak: **${streak}** day${streak === 1 ? '' : 's'}${note}. Miss a day and it resets.\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '📅 Daily reward')],
+  });
+}
+
+async function handleUpgrade(i) {
+  const key = i.options.getString('tool');
+  const uid = i.user.id;
+  const item = SHOP[key];
+  const level = toolLevel(uid, key);
+  if (!level) return fail(i, `You don't own ${item.name} yet. Buy it with \`/buy\`.`);
+  if (level >= MAX_TOOL_LEVEL) return fail(i, `${item.name} is already max level.`);
+
+  const cost = upgradeCost(key, level);
+  if (upgradeTx(uid, key, cost, level) === 'poor') {
+    return fail(i, `Upgrading to level ${level + 1} costs **${fmt(cost)}** ${ORB} but you only have **${fmt(getBalance(uid))}**.`);
+  }
+  return i.reply({
+    embeds: [embed(`${item.name} is now level **${level + 1}**. Payout bonus: ${toolRange(key, level + 1)}.\nBalance: **${fmt(getBalance(uid))}** ${ORB}`, '🔧 Tool upgraded')],
+  });
+}
+
+async function handleLevel(i) {
+  const uid = i.user.id;
+  const { xp, prestige } = progressOf(uid);
+  const level = levelOf(xp);
+  const next = level >= MAX_LEVEL ? 'Max level reached' : `Next level at **${fmt(XP_BASE * level * level)}** XP`;
+  return i.reply({
+    embeds: [
+      embed(
+        `Level **${level}** / ${MAX_LEVEL}\nXP: **${fmt(xp)}** (${next})\nPrestige: **${prestige}** / ${MAX_PRESTIGE} (earn payouts +${Math.round(prestige * PRESTIGE_BONUS * 100)}%)`,
+        '⭐ Your level'
+      ),
+    ],
+  });
+}
+
+async function handlePrestige(i) {
+  const uid = i.user.id;
+  const { xp, prestige } = progressOf(uid);
+  const level = levelOf(xp);
+  if (level < MAX_LEVEL) return fail(i, `You need level **${MAX_LEVEL}** to prestige. You're level **${level}**.`);
+  if (prestige >= MAX_PRESTIGE) return fail(i, 'You are already at max prestige.');
+  q.resetXp.run(uid);
+  return i.reply({
+    embeds: [embed(`Your level and XP reset. Earn payouts are now +${Math.round((prestige + 1) * PRESTIGE_BONUS * 100)}%. Your orbs and items are kept.`, `🌟 Prestige ${prestige + 1}`)],
+  });
+}
+
+/* ───────────── Orb drops ───────────── */
+
+const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
+let nextDropAt = 0;
+
+// Live drop messages are remembered in meta so a restart can close them out.
+const saveDropRefs = () =>
+  q.setMeta.run('active_drops', JSON.stringify([...activeDrops.values()].map((d) => ({ channelId: DROP_CHANNEL_ID, messageId: d.msg.id }))));
+
+async function expireStaleDrops() {
+  const refs = JSON.parse(q.getMeta.get('active_drops')?.value ?? '[]');
+  for (const r of refs) {
+    try {
+      const channel = await client.channels.fetch(r.channelId);
+      const msg = await channel.messages.fetch(r.messageId);
+      await msg.edit({ embeds: [embed('The bot restarted, so this drop ended.', '⌛ Drop expired')], components: [] });
+    } catch (err) {
+      console.error('Could not expire stale drop:', err.message);
+    }
+  }
+  q.setMeta.run('active_drops', '[]');
+}
+
+async function spawnDrop() {
+  const channel = await client.channels.fetch(DROP_CHANNEL_ID);
+  const golden = Math.random() < 0.15;
+  const seq = Number(q.getMeta.get('drop_seq')?.value ?? 0) + 1;
+  q.setMeta.run('drop_seq', String(seq));
+  const prize = Math.floor((golden ? 5 : 1) * DROP_BASE * payoutMultiplier());
+  const title = golden ? '✨ Golden Orb' : '🟠 Orb Drop';
+  const id = Math.random().toString(36).slice(2, 10);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`drop:${id}`).setLabel('Grab it!').setStyle(ButtonStyle.Success)
+  );
+  const msg = await channel.send({
+    embeds: [embed(`First to click wins **${fmt(prize)}** ${ORB}. Expires in ${DROP_EXPIRE_SECONDS / 60} min.`, title)],
+    components: [row],
+  });
+  const timer = setTimeout(() => {
+    if (!activeDrops.delete(id)) return;
+    saveDropRefs();
+    msg.edit({ embeds: [embed('Nobody grabbed it in time.', '⌛ Drop expired')], components: [] }).catch(() => {});
+  }, DROP_EXPIRE_SECONDS * 1000);
+  activeDrops.set(id, { seq, prize, title, msg, timer });
+  saveDropRefs();
+}
+
+async function dropTick() {
+  if (!DROP_CHANNEL_ID) return;
+  const now = nowSec();
+  if (!nextDropAt) nextDropAt = now + rand(DROP_MIN_MINUTES, DROP_MAX_MINUTES) * 60;
+  if (now < nextDropAt) return;
+  nextDropAt = now + rand(DROP_MIN_MINUTES, DROP_MAX_MINUTES) * 60;
+  await spawnDrop();
+}
+
+async function handleDropButton(i) {
+  const id = i.customId.split(':')[1];
+  const d = activeDrops.get(id);
+  if (!d) return i.reply({ content: '❌ Too late, that drop is gone.', flags: EPH });
+
+  // After a win you sit out the next DROP_WAIT drops.
+  const lastSeq = q.getWin.get(i.user.id)?.seq;
+  if (lastSeq !== undefined && d.seq - lastSeq <= DROP_WAIT) {
+    const wait = DROP_WAIT + 1 - (d.seq - lastSeq);
+    return i.reply({ content: `❌ You won recently. Wait **${wait}** more drop${wait === 1 ? '' : 's'} before you can win again.`, flags: EPH });
+  }
+
+  activeDrops.delete(id);
+  clearTimeout(d.timer);
+  saveDropRefs();
+  const granted = mintTx(i.user.id, d.prize);
+  if (granted <= 0) {
+    return i.update({ embeds: [embed('The orb vault is empty, so nobody gets this one.', '🏦 Vault empty')], components: [] });
+  }
+  q.setWin.run(i.user.id, d.seq);
+  return i.update({
+    embeds: [embed(`<@${i.user.id}> grabbed it and earned **${fmt(granted)}** ${ORB}\nBalance: **${fmt(getBalance(i.user.id))}** ${ORB}`, `🎉 ${d.title} claimed`)],
+    components: [],
+  });
+}
+
 /* ───────────── Client ───────────── */
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
 client.on(Events.InteractionCreate, async (i) => {
-  if (i.isButton()) return handleChallengeButton(i).catch(console.error);
+  if (i.isButton()) {
+    const handler = i.customId.startsWith('drop:') ? handleDropButton : handleChallengeButton;
+    return handler(i).catch(console.error);
+  }
   if (!i.isChatInputCommand()) return;
   if (!i.inGuild()) return fail(i, 'Use me in a server.');
 
@@ -602,10 +923,11 @@ client.on(Events.InteractionCreate, async (i) => {
         const target = i.options.getUser('user');
         const amount = i.options.getInteger('amount');
         if (target.bot || target.id === i.user.id) return fail(i, "Pick another real player.");
-        if (!transferTx(i.user.id, target.id, amount)) {
-          return fail(i, `You only have **${fmt(getBalance(i.user.id))}** ${ORB}.`);
-        }
-        return i.reply({ content: `${ORB} ${i.user} paid ${target} **${fmt(amount)}** mana orbs.` });
+        const received = transferTx(i.user.id, target.id, amount);
+        if (received === false) return fail(i, `You only have **${fmt(getBalance(i.user.id))}** ${ORB}.`);
+        if (received === 0) return fail(i, 'That\'s too small to cover the 10% tax. Send at least 2 orbs.');
+        const tax = amount - received;
+        return i.reply({ content: `${ORB} ${i.user} paid ${target} **${fmt(received)}** mana orbs (**${fmt(tax)}** tax went back to the vault).` });
       }
       case 'supply': {
         const cap = supplyCap();
@@ -621,7 +943,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
       case 'shop': {
         const lines = Object.entries(SHOP).map(
-          ([, s]) => `**${s.name}** — ${fmt(s.price)} ${ORB}\n${s.desc}`
+          ([key, s]) => `**${s.name}** — ${fmt(priceOf(key))} ${ORB}\n${s.desc}`
         );
         return i.reply({ embeds: [embed(lines.join('\n\n') + '\n\nUse `/buy` to purchase.', '🛒 Shop')] });
       }
@@ -635,6 +957,14 @@ client.on(Events.InteractionCreate, async (i) => {
           : 'Nobody has any orbs yet. Try `/work`!';
         return i.reply({ embeds: [embed(text, '🏆 Richest players')] });
       }
+      case 'daily':
+        return await handleDaily(i);
+      case 'upgrade':
+        return await handleUpgrade(i);
+      case 'level':
+        return await handleLevel(i);
+      case 'prestige':
+        return await handlePrestige(i);
       case 'salary':
         return await handleSalary(i);
     }
@@ -659,7 +989,8 @@ async function salaryTick() {
     const rows = q.salaries.all(guild.id);
     if (!rows.length) continue;
     try {
-      const members = await guild.members.fetch();
+      // Only hit the API when the cache is incomplete.
+      const members = guild.members.cache.size >= guild.memberCount ? guild.members.cache : await guild.members.fetch();
       const payouts = [];
       for (const m of members.values()) {
         if (m.user.bot) continue;
@@ -678,6 +1009,7 @@ async function salaryTick() {
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   supplyStart();
+  await expireStaleDrops().catch((err) => console.error('Drop cleanup failed:', err.message));
   try {
     // Clear the other scope so commands don't show up twice (global + guild).
     if (GUILD_ID) {
@@ -692,6 +1024,7 @@ client.once(Events.ClientReady, async (c) => {
     console.error('Command registration failed:', err.message);
   }
   setInterval(() => salaryTick().catch(console.error), 60 * 1000);
+  setInterval(() => dropTick().catch(console.error), 60 * 1000);
 });
 
 client.login(TOKEN);
