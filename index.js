@@ -426,6 +426,7 @@ const commands = [
         .setRequired(true)
         .addChoices(...Object.entries(SHOP).filter(([, s]) => s.perk).map(([value, s]) => ({ name: s.name, value })))
     ),
+  new SlashCommandBuilder().setName('changelog').setDescription('Show the latest update to the bot'),
   new SlashCommandBuilder().setName('level').setDescription('See your level, XP and prestige'),
   new SlashCommandBuilder().setName('prestige').setDescription(`Reset your level for a permanent payout bonus (needs level ${MAX_LEVEL})`),
   new SlashCommandBuilder()
@@ -898,6 +899,35 @@ async function handleDropButton(i) {
   });
 }
 
+/* ───────────── Changelog ───────────── */
+
+// Read from GitHub so it works on Railway, where there's no local .git folder.
+const CHANGELOG_REPO = process.env.CHANGELOG_REPO || 'TECWiSaRd/Geometry-Droid';
+const CHANGELOG_CACHE_MS = 5 * 60 * 1000;
+let changelogCache = { at: 0, text: null };
+
+async function handleChangelog(i) {
+  await i.deferReply();
+  if (Date.now() - changelogCache.at > CHANGELOG_CACHE_MS) {
+    const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'gd-orbs-bot' };
+    if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`; // needed for private repos
+    const res = await fetch(`https://api.github.com/repos/${CHANGELOG_REPO}/commits?per_page=1`, { headers });
+    if (!res.ok) return fail(i, `Couldn't fetch the latest commit (GitHub returned ${res.status}).`);
+    const [c] = await res.json();
+    const [title, ...rest] = c.commit.message.split('\n');
+    const body = rest.filter((line) => !line.startsWith('Co-Authored-By:')).join('\n').trim();
+    const when = Math.floor(Date.parse(c.commit.author.date) / 1000);
+    const text = [
+      `**${title}**`,
+      body,
+      `\`${c.sha.slice(0, 7)}\` by ${c.commit.author.name} · <t:${when}:R>`,
+      c.html_url,
+    ].filter(Boolean).join('\n\n');
+    changelogCache = { at: Date.now(), text: text.slice(0, 4000) };
+  }
+  return i.editReply({ embeds: [embed(changelogCache.text, '📜 Latest update')] });
+}
+
 /* ───────────── Client ───────────── */
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
@@ -961,6 +991,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleDaily(i);
       case 'upgrade':
         return await handleUpgrade(i);
+      case 'changelog':
+        return await handleChangelog(i);
       case 'level':
         return await handleLevel(i);
       case 'prestige':
