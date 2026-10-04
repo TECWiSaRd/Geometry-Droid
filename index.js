@@ -643,6 +643,12 @@ const sellStockTx = db.transaction((uid, sym, shares, price) => {
   return { result: 'ok', proceeds, basis };
 });
 
+// Lists a level, replacing its pending proposal if there is one.
+const listPendingTx = db.transaction((pendingSym, sym, name, id, proposer, now) => {
+  if (pendingSym) q.delStock.run(pendingSym);
+  q.insertStock.run(sym, name, 'level', id, 'listed', proposer, now, now);
+});
+
 // Delisting pays every holder at the last price (shared out if the vault is short) and wipes the stock.
 const delistTx = db.transaction((sym, price) => {
   const holders = q.holdersOf.all(sym);
@@ -2244,10 +2250,11 @@ async function stockAutocomplete(i) {
 }
 
 // Looks a level up on GDBrowser and checks it can be listed.
-async function checkLevel(id) {
+// `allowPending` lets moderators list a level that is still waiting for approval.
+async function checkLevel(id, { allowPending = false } = {}) {
   if (!/^\d{1,12}$/.test(id)) return { error: 'Level IDs are numbers, like \`10565740\`.' };
   const existing = q.stockByRef.get('level', id);
-  if (existing) return { error: `That level is already ${existing.status === 'pending' ? 'waiting for approval' : `listed as **${existing.sym}**`}.` };
+  if (existing && !(allowPending && existing.status === 'pending')) return { error: `That level is already ${existing.status === 'pending' ? 'waiting for approval' : `listed as **${existing.sym}**`}.` };
   if (q.listedCount.get().n >= STOCK_MAX) return { error: `The market is full (${STOCK_MAX} stocks). A moderator has to remove one first.` };
   const lvl = await fetchJson(`https://gdbrowser.com/api/level/${id}`).catch(() => null);
   if (!lvl || typeof lvl.downloads !== 'number') return { error: "I couldn't find that level on the Geometry Dash servers." };
@@ -2408,22 +2415,31 @@ async function handleStock(i) {
   if (sub === 'propose' || sub === 'add') {
     if (sub === 'add' && !isMod(i)) return fail(i, 'You need Manage Server for that. Use \`/stock propose\` instead.');
     if (sub === 'propose' && q.pendingBy.get(uid)) return fail(i, 'You already have a proposal waiting for review.');
+    const id = i.options.getString('level_id').trim();
+    // A moderator adding a level that's waiting for approval lists it straight away.
+    const proposal = sub === 'add' ? q.stockByRef.get('level', id) : null;
+    const pending = proposal?.status === 'pending' ? proposal : null;
     const custom = i.options.getString('symbol')?.trim().toUpperCase() ?? null;
     if (custom && !/^[A-Z][A-Z0-9]{1,4}$/.test(custom)) return fail(i, 'Symbols are 2-5 letters or numbers, starting with a letter.');
-    if (custom && q.stockBySym.get(custom)) return fail(i, `**${custom}** is already taken.`);
+    if (custom && custom !== pending?.sym && q.stockBySym.get(custom)) return fail(i, `**${custom}** is already taken.`);
     await i.deferReply({ flags: EPH });
-    const id = i.options.getString('level_id').trim();
-    const { lvl, error } = await checkLevel(id);
+    const { lvl, error } = await checkLevel(id, { allowPending: sub === 'add' });
     if (error) return fail(i, error);
-    const sym = custom ?? makeSymbol(lvl.name);
+    const sym = custom ?? pending?.sym ?? makeSymbol(lvl.name);
     const name = String(lvl.name).slice(0, 40);
     const now = nowSec();
 
     if (sub === 'add') {
-      q.insertStock.run(sym, name, 'level', id, 'listed', uid, now, now);
+      listPendingTx(pending?.sym, sym, name, id, pending?.proposer ?? uid, now);
       const st = q.stockBySym.get(sym);
       await announceListing(st);
-      return i.editReply({ content: `📈 Listed **${sym}** (${name}). Trading opens <t:${opensAt(st)}:R>.` });
+      if (pending) {
+        const done = { content: '', embeds: [embed(`**${sym}** (${name}) was added by ${i.user} with \`/stock add\`. Trading opens <t:${opensAt(st)}:R>.`, '📈 Listing approved')], components: [] };
+        await closeReviews('stock', pending.sym, done);
+        if (pending.proposer !== uid) await tellPlayer(pending.proposer, `Your proposal was approved! **${sym}** (${name}) opens for trading <t:${opensAt(st)}:R>.`, '📈 Listing approved');
+      }
+      const was = pending ? ` It was waiting for approval (proposed by <@${pending.proposer}>), so the review is closed.` : '';
+      return i.editReply({ content: `📈 Listed **${sym}** (${name}). Trading opens <t:${opensAt(st)}:R>.${was}` });
     }
 
     q.insertStock.run(sym, name, 'level', id, 'pending', uid, 0, now);
