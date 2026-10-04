@@ -21,6 +21,7 @@ const GUILD_ID = process.env.GUILD_ID; // optional: instant command updates in o
 const DB_PATH = process.env.DB_PATH || './data/orbs.db';
 const SALARY_INTERVAL_MIN = Number(process.env.SALARY_INTERVAL_MINUTES) || 60;
 
+console.log('Starting bot…');
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN');
   process.exit(1);
@@ -305,6 +306,7 @@ const ACHIEVEMENTS = [
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+console.log(`Database opened at ${DB_PATH}`);
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -2770,6 +2772,23 @@ async function handleChangelog(i) {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
+// Connection logging, so a stalled start shows where it stopped. Discord's login limit
+// ("session limit") is the usual silent culprit: discord.js waits until it resets.
+// Set DEBUG_DISCORD=1 to see every gateway message.
+client.on(Events.Debug, (msg) => {
+  if (process.env.DEBUG_DISCORD === '1' || (/session limit|remaining|identif|ready|invalid|close|rate ?limit|fetched gateway/i.test(msg) && !/heartbeat/i.test(msg))) {
+    console.log('[discord]', msg);
+  }
+});
+client.on(Events.Warn, (msg) => console.warn('[discord warning]', msg));
+client.on(Events.Error, (err) => console.error('[discord error]', err));
+client.on(Events.ShardDisconnect, (e, id) => console.warn(`[discord] shard ${id} disconnected (code ${e?.code})`));
+client.on(Events.ShardReconnecting, (id) => console.warn(`[discord] shard ${id} reconnecting`));
+
+// Log stray errors instead of crashing; a crash-restart loop can use up Discord's daily logins.
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+
 client.on(Events.InteractionCreate, async (i) => {
   if (i.isButton()) {
     const handler =
@@ -2936,4 +2955,11 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(() => stockTick().catch(console.error), STOCK_POLL_MINUTES * 60 * 1000);
 });
 
-client.login(TOKEN);
+console.log('Logging in to Discord…');
+client
+  .login(TOKEN)
+  .then(() => console.log('Connected to the gateway, waiting for servers to load…'))
+  .catch((err) => {
+    console.error('Discord login failed:', err.message);
+    process.exit(1);
+  });
