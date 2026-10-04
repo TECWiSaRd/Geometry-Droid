@@ -663,9 +663,11 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   supplyStart();
   try {
+    // Clear the other scope so commands don't show up twice (global + guild).
     if (GUILD_ID) {
       const guild = await c.guilds.fetch(GUILD_ID);
       await guild.commands.set(commands);
+      await c.application.commands.set([]);
     } else {
       await c.application.commands.set(commands);
     }
