@@ -921,7 +921,7 @@ async function handleChangelog(i) {
       `**${title}**`,
       body,
       `\`${c.sha.slice(0, 7)}\` by ${c.commit.author.name} · <t:${when}:R>`,
-      c.html_url,
+      `[View commit](${c.html_url}) · [Deployments](https://github.com/${CHANGELOG_REPO}/deployments)`,
     ].filter(Boolean).join('\n\n');
     changelogCache = { at: Date.now(), text: text.slice(0, 4000) };
   }
