@@ -5,7 +5,7 @@ Geometry Dash themed Discord economy bot.
 ## Commands
 - `/balance [user]`, `/leaderboard`
 - `/work` (5m), `/build` (10m), `/fish` (3m), `/mine` (15m): earn orbs, with rare bonus rolls
-- `/quiz` (3m): answer a Geometry Dash trivia question within 30s to earn orbs (always a challenge; wrong answers count as fails)
+- `/quiz` (3m): answer a Geometry Dash trivia question within 30s to earn 200-500 orbs (always a challenge; wrong answers count as fails)
 - `/pay user amount`
 - `/shop`, `/buy item`: Image Permissions (1,000), Admin Permissions (1 trillion), Salary Raise (20,000, +5% salary), Good Resumé (500,000, +25% salary), Diamond Pickaxe (5,000, +2-10% mining), Good Fishing Rod (4,000, +2-15% fishing)
 - `/salary set|remove|list` (Manage Server): automatic role payments
