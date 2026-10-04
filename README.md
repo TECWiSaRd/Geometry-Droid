@@ -52,13 +52,15 @@ SALARY_INTERVAL_MINUTES=60
 # Optional channels and roles:
 # DROP_CHANNEL_ID=channel-id          orb drops
 # EVENT_CHANNEL_ID=channel-id         raids, weekly and season announcements (defaults to DROP_CHANNEL_ID)
-# REVIEW_CHANNEL_ID=channel-id        where stock proposals are reviewed (defaults to the channel used)
-# LOTW_REVIEW_CHANNEL_ID=channel-id   where Level of the Week proofs are reviewed (defaults to REVIEW_CHANNEL_ID, then the channel used)
+# REVIEW_CHANNEL_ID=channel-id        fallback for stock proposals if no moderator can be DMed (defaults to the channel used)
+# LOTW_REVIEW_CHANNEL_ID=channel-id   fallback for Level of the Week proofs (defaults to REVIEW_CHANNEL_ID, then the channel used)
 # SEASON_ROLE_ID=role-id              given to each season's #1 (the bot's role must be above it)
 # GITHUB_TOKEN=token                  only needed for /changelog if the repo is private
 ```
 
 The bot needs View Channel, Send Messages, Embed Links and Attach Files in the drop, event and review channels.
+
+**Moderator reviews by DM:** Level of the Week proofs and stock proposals are sent by DM to every member with Manage Server (up to 25), with Approve/Reject buttons. When one moderator decides, the other copies are updated, and the player is told the result by DM (or in the event channel if their DMs are closed). If no moderator can be DMed, the request goes to `REVIEW_CHANNEL_ID` / `LOTW_REVIEW_CHANNEL_ID`, or the channel it was made in. Moderators need DMs from server members turned on.
 
 Railway runs `npm start` automatically.
 

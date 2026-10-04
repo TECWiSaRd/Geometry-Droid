@@ -113,6 +113,7 @@ const DEFAULT_STOCKS = {
 const STOCK_MAX = 20; // listed stocks at once (each is one GDBrowser request per update)
 const STOCK_MIN_DOWNLOADS = 1_000_000; // proposed levels need this many, so a few alts can't move the price
 const STOCK_WARMUP_HOURS = 36; // new listings collect data this long before trading opens
+const MAX_REVIEW_DMS = 25; // review requests go to at most this many moderators by DM
 const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID || LOTW_REVIEW_CHANNEL_ID; // where stock proposals go; also clears if LOTW_REVIEW_CHANNEL_ID isn't set
 const STOCK_BASE = 1_000; // price at a stock's usual level. Fixed, so holding doesn't ride payout growth for free
 const STOCK_RANGE = [0.25, 4]; // price floor and ceiling, as multiples of the base
@@ -411,6 +412,10 @@ CREATE TABLE IF NOT EXISTS item_uses (
   user_id TEXT NOT NULL, item TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL,
   PRIMARY KEY (user_id, item, day)
 );
+CREATE TABLE IF NOT EXISTS review_msgs (
+  kind TEXT NOT NULL, ref TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
+  PRIMARY KEY (kind, ref, message_id)
+);
 CREATE TABLE IF NOT EXISTS stocks (
   sym TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
   status TEXT NOT NULL, proposer TEXT, listed_at INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
@@ -518,6 +523,9 @@ const q = {
   setBuff: db.prepare('INSERT OR REPLACE INTO buffs (user_id, buff, until) VALUES (?, ?, ?)'),
   getUses: db.prepare('SELECT n FROM item_uses WHERE user_id = ? AND item = ? AND day = ?'),
   addUse: db.prepare('INSERT INTO item_uses (user_id, item, day, n) VALUES (?, ?, ?, 1) ON CONFLICT(user_id, item, day) DO UPDATE SET n = n + 1'),
+  addReviewMsg: db.prepare('INSERT OR IGNORE INTO review_msgs (kind, ref, channel_id, message_id) VALUES (?, ?, ?, ?)'),
+  reviewMsgs: db.prepare('SELECT channel_id, message_id FROM review_msgs WHERE kind = ? AND ref = ?'),
+  delReviewMsgs: db.prepare('DELETE FROM review_msgs WHERE kind = ? AND ref = ?'),
   insertStock: db.prepare('INSERT INTO stocks (sym, name, kind, ref_id, status, proposer, listed_at, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
   stockBySym: db.prepare('SELECT * FROM stocks WHERE sym = ?'),
   stockByRef: db.prepare('SELECT * FROM stocks WHERE kind = ? AND ref_id = ?'),
@@ -2042,6 +2050,57 @@ async function handleSeason(i) {
 const lotwReward = (stars) => Math.floor(LOTW_REWARD_PER_STAR * stars * payoutMultiplier());
 const isMod = (i) => i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
 
+/* ───────────── Moderator reviews (by DM) ───────────── */
+
+// Review buttons can be clicked in a DM, where Discord sends no server permissions, so look the
+// clicker up in the server the request came from.
+async function canReview(i, guildId) {
+  if (i.inGuild()) return !!isMod(i);
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  const member = await guild?.members.fetch(i.user.id).catch(() => null);
+  return !!member?.permissions.has(PermissionFlagsBits.ManageGuild);
+}
+
+async function moderators(guild) {
+  const members = guild.members.cache.size >= guild.memberCount ? guild.members.cache : await guild.members.fetch().catch(() => guild.members.cache);
+  return [...members.values()].filter((m) => !m.user.bot && m.permissions.has(PermissionFlagsBits.ManageGuild)).slice(0, MAX_REVIEW_DMS);
+}
+
+// Sends a review request to every moderator by DM. `withoutFiles` is retried when an upload fails.
+// If no moderator can be reached, it goes to the fallback channel instead. Returns how many were sent.
+async function sendForReview(guild, fallbackChannel, kind, ref, payload, withoutFiles) {
+  const send = (target) => target.send(payload).catch(() => (withoutFiles ? target.send(withoutFiles) : null)).catch(() => null);
+  const sent = [];
+  for (const m of await moderators(guild)) {
+    const msg = await send(m);
+    if (msg) sent.push(msg);
+  }
+  if (!sent.length && fallbackChannel) {
+    const msg = await send(fallbackChannel);
+    if (msg) sent.push(msg);
+  }
+  for (const msg of sent) q.addReviewMsg.run(kind, String(ref), msg.channelId, msg.id);
+  return sent.length;
+}
+
+// Once one moderator decides, every other copy shows the outcome instead of live buttons.
+async function closeReviews(kind, ref, payload, exceptId) {
+  for (const r of q.reviewMsgs.all(kind, String(ref))) {
+    if (r.message_id === exceptId) continue;
+    const channel = await client.channels.fetch(r.channel_id).catch(() => null);
+    const msg = await channel?.messages.fetch(r.message_id).catch(() => null);
+    await msg?.edit(payload).catch(() => {});
+  }
+  q.delReviewMsgs.run(kind, String(ref));
+}
+
+// Tells a player the result by DM, or in the event channel if their DMs are closed.
+async function tellPlayer(userId, text, title) {
+  const user = await client.users.fetch(userId).catch(() => null);
+  const ok = await user?.send({ embeds: [embed(text, title)] }).then(() => true, () => false);
+  if (!ok) await announce(`<@${userId}> ${text}`, title);
+}
+
 async function handleLotw(i) {
   const sub = i.options.getSubcommand();
   const level = q.getLotw.get(i.guildId);
@@ -2093,48 +2152,51 @@ async function handleLotw(i) {
   await i.deferReply({ flags: EPH });
 
   const reviewId = LOTW_REVIEW_CHANNEL_ID || REVIEW_CHANNEL_ID;
-  const review = reviewId ? await client.channels.fetch(reviewId).catch(() => null) : i.channel;
+  const fallback = reviewId ? await client.channels.fetch(reviewId).catch(() => null) : i.channel;
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`lotw:approve:${row.id}`).setLabel('Approve').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`lotw:reject:${row.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
   );
   const e = embed(`${i.user} says they beat **${level.name}** (ID \`${level.level_id}\`, ${level.stars}★).\nReward if approved: **${fmt(lotwReward(level.stars))}** ${ORB}`, '🎮 Clear to review');
   // Re-upload the proof so it doesn't vanish when Discord's attachment link expires; fall back to the link if it's too big.
-  const sent = await review
-    ?.send({ embeds: [e], components: [buttons], files: [{ attachment: proof.url, name: proof.name }] })
-    .catch(() => review.send({ embeds: [e.setDescription(`${e.data.description}\n\nProof: ${proof.url}`)], components: [buttons] }))
-    .catch(() => null);
+  const linkOnly = embed(`${e.data.description}\n\nProof: ${proof.url}`, e.data.title);
+  const sent = await sendForReview(
+    i.guild,
+    fallback,
+    'lotw',
+    row.id,
+    { embeds: [e], components: [buttons], files: [{ attachment: proof.url, name: proof.name }] },
+    { embeds: [linkOnly], components: [buttons] }
+  );
   if (!sent) {
     q.reviewClear.run({ status: 'rejected', reviewer: null, id: row.id }); // frees the slot so they can try again
-    return fail(i, "I couldn't post your proof for review (check my permissions in the review channel). Try again later.");
+    return fail(i, "I couldn't reach any moderators or the review channel. Try again later.");
   }
   return i.editReply({ content: '📨 Proof sent to the moderators. You will be paid when it is approved.' });
 }
 
 async function handleLotwButton(i) {
   const [, action, id] = i.customId.split(':');
-  if (!isMod(i)) return i.reply({ content: '❌ Only moderators (Manage Server) can review clears.', flags: EPH });
   const pending = q.subById.get(Number(id));
   if (!pending) return i.reply({ content: '❌ That submission no longer exists.', flags: EPH });
+  if (!(await canReview(i, pending.guild_id))) return i.reply({ content: '❌ Only moderators (Manage Server) can review clears.', flags: EPH });
   if (pending.user_id === i.user.id) return i.reply({ content: "❌ You can't review your own clear.", flags: EPH });
 
   const row = q.reviewClear.get({ status: action === 'approve' ? 'approved' : 'rejected', reviewer: i.user.id, id: Number(id) });
   if (!row) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
 
   if (action !== 'approve') {
-    return i.update({
-      content: `<@${row.user_id}>, your clear was not accepted. You can submit new proof with \`/lotw submit\`.`,
-      embeds: [embed(`Rejected by ${i.user}.`, '🎮 Clear rejected')],
-      components: [],
-    });
+    const done = { content: '', embeds: [embed(`<@${row.user_id}>'s clear was rejected by ${i.user}.`, '🎮 Clear rejected')], components: [] };
+    await i.update(done);
+    await closeReviews('lotw', id, done, i.message?.id);
+    return tellPlayer(row.user_id, 'Your Level of the Week clear was not accepted. You can send new proof with `/lotw submit`.', '🎮 Clear rejected');
   }
   const granted = mintTx(row.user_id, lotwReward(row.stars));
   const notes = afterEarn(row.user_id, row.guild_id, ['lotw'], granted);
-  return i.update({
-    content: `<@${row.user_id}>, your clear was verified!`,
-    embeds: [embed(withNotes(`Approved by ${i.user}. <@${row.user_id}> earned **${fmt(granted)}** ${ORB}.`, notes), '🎮 Clear verified')],
-    components: [],
-  });
+  const done = { content: '', embeds: [embed(`<@${row.user_id}>'s clear was approved by ${i.user}. They earned **${fmt(granted)}** ${ORB}.`, '🎮 Clear verified')], components: [] };
+  await i.update(done);
+  await closeReviews('lotw', id, done, i.message?.id);
+  return tellPlayer(row.user_id, withNotes(`Your Level of the Week clear was verified! You earned **${fmt(granted)}** ${ORB}.`, notes), '🎮 Clear verified');
 }
 
 /* ───────────── Stocks ───────────── */
@@ -2194,25 +2256,27 @@ async function announceListing(st) {
 }
 
 async function handleStockButton(i) {
-  const [, action, sym] = i.customId.split(':');
-  if (!isMod(i)) return i.reply({ content: '❌ Only moderators (Manage Server) can review listings.', flags: EPH });
+  const [, action, sym, guildId] = i.customId.split(':');
+  if (!(await canReview(i, guildId))) return i.reply({ content: '❌ Only moderators (Manage Server) can review listings.', flags: EPH });
   const st = q.stockBySym.get(sym);
   if (!st || st.status !== 'pending') return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
   if (st.proposer === i.user.id) return i.reply({ content: "❌ You can't review your own proposal.", flags: EPH });
 
   if (action === 'reject') {
     q.delStock.run(sym);
-    return i.update({ content: `<@${st.proposer}>, your proposal for **${st.name}** was not accepted.`, embeds: [embed(`Rejected by ${i.user}.`, '📈 Listing rejected')], components: [] });
+    const done = { content: '', embeds: [embed(`<@${st.proposer}>'s proposal for **${st.name}** was rejected by ${i.user}.`, '📈 Listing rejected')], components: [] };
+    await i.update(done);
+    await closeReviews('stock', sym, done, i.message?.id);
+    return tellPlayer(st.proposer, `Your proposal to list **${st.name}** was not accepted.`, '📈 Listing rejected');
   }
   if (q.listedCount.get().n >= STOCK_MAX) return i.reply({ content: `❌ The market is full (${STOCK_MAX}). Remove a stock with \`/stock remove\` first.`, flags: EPH });
   if (q.approveStock.run(nowSec(), sym).changes === 0) return i.reply({ content: '❌ Someone already reviewed this one.', flags: EPH });
   const listed = q.stockBySym.get(sym);
   announceListing(listed).catch(() => {});
-  return i.update({
-    content: `<@${st.proposer}>, your proposal was approved!`,
-    embeds: [embed(`Approved by ${i.user}. **${sym}** (${st.name}) opens for trading <t:${opensAt(listed)}:R>.`, '📈 Listing approved')],
-    components: [],
-  });
+  const done = { content: '', embeds: [embed(`**${sym}** (${st.name}) was approved by ${i.user}. Trading opens <t:${opensAt(listed)}:R>.`, '📈 Listing approved')], components: [] };
+  await i.update(done);
+  await closeReviews('stock', sym, done, i.message?.id);
+  return tellPlayer(st.proposer, `Your proposal was approved! **${sym}** (${st.name}) opens for trading <t:${opensAt(listed)}:R>.`, '📈 Listing approved');
 }
 
 async function fetchJson(url) {
@@ -2355,27 +2419,25 @@ async function handleStock(i) {
     }
 
     q.insertStock.run(sym, name, 'level', id, 'pending', uid, 0, now);
-    const review = REVIEW_CHANNEL_ID ? await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null) : i.channel;
+    const fallback = REVIEW_CHANNEL_ID ? await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null) : i.channel;
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`stk:approve:${sym}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`stk:reject:${sym}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`stk:approve:${sym}:${i.guildId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`stk:reject:${sym}:${i.guildId}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
     );
-    const posted = await review
-      ?.send({
-        embeds: [
-          embed(
-            `${i.user} wants to list **${name}** by ${lvl.author} (ID \`${id}\`) as **${sym}**.\n` +
-              `Downloads: **${fmt(lvl.downloads)}** · Likes: **${fmt(lvl.likes ?? 0)}** · ${lvl.difficulty ?? 'Unknown'}\n\n` +
-              `If approved, it collects data for ${STOCK_WARMUP_HOURS}h before trading opens. Moderators can pick their own symbol with \`/stock add\` instead.`,
-            '📈 Stock proposal'
-          ),
-        ],
-        components: [row],
-      })
-      .catch(() => null);
+    const posted = await sendForReview(i.guild, fallback, 'stock', sym, {
+      embeds: [
+        embed(
+          `${i.user} wants to list **${name}** by ${lvl.author} (ID \`${id}\`) as **${sym}**.\n` +
+            `Downloads: **${fmt(lvl.downloads)}** · Likes: **${fmt(lvl.likes ?? 0)}** · ${lvl.difficulty ?? 'Unknown'}\n\n` +
+            `If approved, it collects data for ${STOCK_WARMUP_HOURS}h before trading opens. Moderators can pick their own symbol with \`/stock add\` instead.`,
+          '📈 Stock proposal'
+        ),
+      ],
+      components: [row],
+    });
     if (!posted) {
       q.delStock.run(sym);
-      return fail(i, "I couldn't post your proposal for review (check my permissions in the review channel). Try again later.");
+      return fail(i, "I couldn't reach any moderators or the review channel. Try again later.");
     }
     return i.editReply({ content: `📨 Proposed **${name}** as **${sym}**. A moderator will review it.` });
   }
@@ -2557,8 +2619,8 @@ function helpText(topic) {
       `\`/salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
       `\`/raid start\`: summon a raid boss in the current channel\n` +
       `\`/tournament\`: run a trivia tournament in the current channel\n` +
-      `\`/lotw set|end\`: choose the Level of the Week. Review clears with the Approve and Reject buttons\n` +
-      `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). Review player proposals with the buttons\n\n` +
+      `\`/lotw set|end\`: choose the Level of the Week. Clears and stock proposals are sent to every moderator by DM with Approve and Reject buttons\n` +
+      `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). \n\n` +
       `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`REVIEW_CHANNEL_ID\` (stock proposals and clears), ` +
       `\`SEASON_ROLE_ID\` (season champion). See the README.`
     );
