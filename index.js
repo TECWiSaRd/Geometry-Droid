@@ -66,6 +66,11 @@ const RAID_POOL = 50_000; // shared reward, split by damage; scales with payouts
 const RAID_DAMAGE = { work: 10, build: 15, fish: 8, mine: 20, quiz: 20, daily: 25, drop: 15 };
 const RAID_CRIT = 0.1; // chance of a double-damage hit
 const RAID_BOSSES = ['😈 Demon Guardian', '🔥 Lava Pit Demon', '🗝️ Vault Keeper', '💀 Nine Circles Wraith'];
+// Secret Coins: three per earn command, named after official levels. Found at random while earning.
+const COIN_SETS = { work: 'Stereo Madness', build: 'Back On Track', fish: 'Polargeist', mine: 'Dry Out', quiz: 'Base After Base' };
+const COINS_PER_SET = 3;
+const COIN_CHANCE = 0.03; // per paid earn
+const COIN_SET_REWARD = 5_000; // for completing a set; scales with payouts
 
 // Anti-AFK / anti-bot checks
 const CHALLENGE_CHANCE = 0.2; // random chance per earn command
@@ -222,6 +227,8 @@ const ACHIEVEMENTS = [
   { key: 'dedicated', name: '📅 Dedicated', desc: 'Reach a 30-day /daily streak', stat: 'daily_streak', goal: 30, reward: 10_000 },
   { key: 'founder', name: '🏰 Founder', desc: 'Found a clan', stat: 'clan_founded', goal: 1, reward: 1_000 },
   { key: 'demon_slayer', name: '🗡️ Demon Slayer', desc: 'Help defeat 3 raid bosses', stat: 'raids_won', goal: 3, reward: 5_000 },
+  { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
+  { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
 
 /* ───────────── Database ───────────── */
@@ -298,6 +305,10 @@ CREATE TABLE IF NOT EXISTS raid_damage (
   guild_id TEXT NOT NULL, user_id TEXT NOT NULL, dmg INTEGER NOT NULL,
   PRIMARY KEY (guild_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS coins (
+  user_id TEXT NOT NULL, coin TEXT NOT NULL, ts INTEGER NOT NULL,
+  PRIMARY KEY (user_id, coin)
+);
 `);
 
 const q = {
@@ -360,6 +371,8 @@ const q = {
   raidDamage: db.prepare('SELECT user_id, dmg FROM raid_damage WHERE guild_id = ? ORDER BY dmg DESC'),
   delRaid: db.prepare('DELETE FROM raids WHERE guild_id = ?'),
   delRaidDamage: db.prepare('DELETE FROM raid_damage WHERE guild_id = ?'),
+  userCoins: db.prepare('SELECT coin FROM coins WHERE user_id = ?'),
+  addCoin: db.prepare('INSERT OR IGNORE INTO coins (user_id, coin, ts) VALUES (?, ?, ?)'),
 };
 
 const getBalance = (id) => q.bal.get(id)?.balance ?? 0;
@@ -650,6 +663,10 @@ const commands = [
     .setDescription('Fight the raid boss together')
     .addSubcommand((s) => s.setName('status').setDescription('Boss HP and top hitters'))
     .addSubcommand((s) => s.setName('start').setDescription('Summon a boss in this channel now (Manage Server)')),
+  new SlashCommandBuilder()
+    .setName('coins')
+    .setDescription('See your Secret Coin collection')
+    .addUserOption((o) => o.setName('user').setDescription('Someone else')),
   new SlashCommandBuilder()
     .setName('achievements')
     .setDescription('See unlocked achievements and progress')
@@ -1313,6 +1330,43 @@ async function handleRaid(i) {
   return i.reply({ embeds: [e] });
 }
 
+/* ───────────── Secret Coins ───────────── */
+
+const coinName = (action, n) => `${COIN_SETS[action]} Coin ${n}`;
+
+// Each paid earn has a small chance to turn up a coin you're missing from that command's set.
+earnHooks.push(({ uid, events, notes }) => {
+  const action = events.find((e) => COIN_SETS[e]);
+  if (!action || Math.random() >= COIN_CHANCE) return;
+  const owned = new Set(q.userCoins.all(uid).map((r) => r.coin));
+  const missing = [];
+  for (let n = 1; n <= COINS_PER_SET; n++) if (!owned.has(`${action}:${n}`)) missing.push(n);
+  if (!missing.length) return;
+  const n = pick(missing);
+  q.addCoin.run(uid, `${action}:${n}`, nowSec());
+  const have = COINS_PER_SET - missing.length + 1;
+  notes.push(`🪙 You found a Secret Coin: **${coinName(action, n)}** (${have}/${COINS_PER_SET})`);
+  if (have === COINS_PER_SET) {
+    const granted = mintTx(uid, Math.floor(COIN_SET_REWARD * payoutMultiplier()));
+    notes.push(`✨ **${COIN_SETS[action]}** set complete!${granted ? ` (+${fmt(granted)} ${ORB})` : ''}`);
+  }
+  bumpStat(uid, 'coins', 1, notes);
+});
+
+async function handleCoins(i) {
+  const user = i.options.getUser('user') ?? i.user;
+  const owned = new Set(q.userCoins.all(user.id).map((r) => r.coin));
+  const lines = Object.entries(COIN_SETS).map(([action, level]) => {
+    let row = '';
+    for (let n = 1; n <= COINS_PER_SET; n++) row += owned.has(`${action}:${n}`) ? '🪙' : '⚫';
+    return `${row} **${level}** (found with \`/${action}\`)`;
+  });
+  const total = Object.keys(COIN_SETS).length * COINS_PER_SET;
+  return i.reply({
+    embeds: [embed(`${lines.join('\n')}\n\nEvery paid earn has a small chance to turn up a coin you're missing. Complete a set for a bonus.`, `🪙 ${user.username}: ${owned.size}/${total} Secret Coins`)],
+  });
+}
+
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
@@ -1498,6 +1552,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleClan(i);
       case 'raid':
         return await handleRaid(i);
+      case 'coins':
+        return await handleCoins(i);
       case 'prestige':
         return await handlePrestige(i);
       case 'salary':
