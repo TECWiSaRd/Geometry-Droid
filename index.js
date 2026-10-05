@@ -2774,9 +2774,11 @@ async function handleStockButton(i) {
   return tellPlayer(st.proposer, `Your proposal was approved! **${sym}** (${st.name}) opens for trading <t:${opensAt(listed)}:R>.`, '📈 Listing approved');
 }
 
-async function fetchJson(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': 'gd-orbs-bot (Discord economy bot)' }, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`${url} returned ${res.status}`);
+async function fetchJson(url, timeoutMs = 15_000) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'gd-orbs-bot (Discord economy bot)' }, signal: AbortSignal.timeout(timeoutMs) }).catch((err) => {
+    throw new Error(err.name === 'TimeoutError' ? `timed out after ${timeoutMs / 1000}s` : err.message);
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
@@ -2813,17 +2815,22 @@ async function stockTick() {
   const now = nowSec();
   const list = q.listedStocks.all();
   const anyPlayers = list.some((x) => x.kind === 'player');
-  const ranking = anyPlayers ? await fetchJson('https://pointercrate.com/api/v1/players/ranking/?limit=100').catch((err) => {
-    console.error('Demonlist fetch failed:', err.message);
-    return null;
-  }) : null;
+  // Pointercrate is often slow even when it's working, so it gets longer.
+  let demonlistError = null;
+  const ranking = anyPlayers
+    ? await fetchJson('https://pointercrate.com/api/v1/players/ranking/?limit=100', 30_000).catch((err) => {
+        demonlistError = err.message;
+        return null;
+      })
+    : null;
+  const failed = [];
 
   const moves = [];
   for (const x of list) {
     const sym = x.sym;
     try {
       const value = x.kind === 'level' ? (await fetchJson(`https://gdbrowser.com/api/level/${x.ref_id}`)).downloads : ranking?.find((p) => String(p.id) === x.ref_id)?.score;
-      if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('no data');
+      if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(x.kind === 'player' && demonlistError ? 'Demonlist unavailable' : 'no data');
       q.addSample.run(sym, now, value);
       const ratio = x.kind === 'level' ? levelRatio(sym, now) : playerRatio(sym, value);
       const price = Math.round(STOCK_BASE * clampRatio(ratio));
@@ -2831,9 +2838,11 @@ async function stockTick() {
       q.addPrice.run(sym, now, price);
       if (prev && Math.abs(price - prev) / prev >= STOCK_NEWS_MOVE) moves.push({ sym, x, prev, price });
     } catch (err) {
-      console.error(`Stock ${sym} update failed:`, err.message);
+      failed.push(`${sym} (${err.message})`);
     }
   }
+  if (demonlistError) console.error(`Stock update: Demonlist (Pointercrate) failed: ${demonlistError}`);
+  if (failed.length) console.error(`Stock update: ${failed.length} of ${list.length} stocks kept their last price: ${failed.join(', ')}`);
   q.pruneSamples.run(now - 8 * DAY_SECONDS);
   q.prunePrices.run(now - 8 * DAY_SECONDS);
 
@@ -3231,19 +3240,35 @@ async function dropTick() {
   const next = Number(q.getMeta.get('drop_next')?.value ?? 0) || scheduleDrop(now);
   if (now < next) return;
   scheduleDrop(now);
-  const channel = await client.channels.fetch(DROP_CHANNEL_ID).catch((err) => {
-    console.error(`Orb drops: can't use channel ${DROP_CHANNEL_ID} (${err.message}). Check the ID and that the bot can view and post there.`);
-    return null;
-  });
-  if (channel) await spawnDrop(channel);
+  const { channel, error } = await dropChannel();
+  if (error) return console.error(`Orb drops: ${error}`);
+  await spawnDrop(channel).catch((err) =>
+    console.error(`Orb drops: couldn't post in ${channel.id} (${err.message}). The bot needs View Channel, Send Messages and Embed Links there.`)
+  );
+}
+
+// Finds a channel orbs can be dropped in, or explains why not.
+async function dropChannel(fallback) {
+  if (!DROP_CHANNEL_ID) return fallback ? { channel: fallback } : { error: 'No drop channel is set (`DROP_CHANNEL_ID`).' };
+  const channel = await client.channels.fetch(DROP_CHANNEL_ID).catch((err) => ({ error: err.message }));
+  if (!channel || channel.error) return { error: `I can't open the drop channel ${DROP_CHANNEL_ID} (${channel?.error ?? 'not found'}). Check the ID and that I can view it.` };
+  if (!channel?.isTextBased?.()) return { error: `<#${DROP_CHANNEL_ID}> isn't a text channel I can post in.` };
+  return { channel };
 }
 
 async function handleDrop(i) {
   if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
-  const channel = DROP_CHANNEL_ID ? await client.channels.fetch(DROP_CHANNEL_ID).catch(() => null) : i.channel;
-  if (!channel) return fail(i, `I can't use the drop channel (\`DROP_CHANNEL_ID\`). Check the ID and that I can view and post there.`);
-  await spawnDrop(channel);
-  return i.reply({ content: `${ORB} Dropped an orb in <#${channel.id}>.`, flags: EPH });
+  await i.deferReply({ flags: EPH });
+  const here = i.channel ?? (await client.channels.fetch(i.channelId).catch(() => null));
+  const { channel, error } = await dropChannel(here);
+  if (error) return fail(i, error);
+  try {
+    await spawnDrop(channel);
+  } catch (err) {
+    console.error(`Orb drop in ${channel.id} failed:`, err.message);
+    return fail(i, `I couldn't post in <#${channel.id}> (${err.message}). I need View Channel, Send Messages and Embed Links there.`);
+  }
+  return i.editReply({ content: `${ORB} Dropped an orb in <#${channel.id}>.` });
 }
 
 async function handleDropButton(i) {
