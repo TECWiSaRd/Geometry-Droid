@@ -106,12 +106,20 @@ const WEEKLY_REWARD = 5_000; // to every contributor when the goal is met; scale
 // divided by the payout multiplier so later seasons aren't inflated.
 const SEASON_DAYS = 30;
 const SEASON_TIERS = [500, 1_500, 3_000, 5_000, 8_000, 12_000, 17_000, 23_000, 30_000, 40_000]; // pass tiers
-const SEASON_TIER_REWARD = 1_000; // x tier number; scales with payouts
+const SEASON_TIER_REWARD = 250; // x tier number; scales with payouts. The full pass adds roughly a third to a season's earnings
 const SEASON_PRIZES = [100_000, 50_000, 25_000]; // top 3 at season end; scale with payouts
 const SEASON_ROLE_ID = process.env.SEASON_ROLE_ID; // optional: moves to each season's #1
 const SEASON_RESETS_PRESTIGE = false; // true wipes everyone's XP and prestige at each season end
 const LOTW_REVIEW_CHANNEL_ID = process.env.LOTW_REVIEW_CHANNEL_ID; // optional: where clear proofs go for review
-const LOTW_REWARD_PER_STAR = 2_000; // per star of the featured level; scales with payouts
+const LOTW_REWARD_PER_STAR = 2_000; // per star for non-demon levels (up to 9★ = 18,000); scales with payouts
+// Demons pay by difficulty instead of stars. Base amounts; they scale with payouts.
+const LOTW_DEMON_REWARDS = {
+  'Easy Demon': 30_000,
+  'Medium Demon': 50_000,
+  'Hard Demon': 80_000,
+  'Insane Demon': 125_000,
+  'Extreme Demon': 200_000,
+};
 // Stocks follow real Geometry Dash stats, refreshed every STOCK_POLL_MINUTES.
 // Level stocks follow download momentum (GDBrowser): downloads in the last 24h vs the level's
 // average day over up to 7 days. Player stocks follow the player's Demonlist score (Pointercrate).
@@ -162,6 +170,7 @@ const SHOP = {
     name: '👑 Admin Permissions',
     desc: 'Full admin on the server. Only for true Demon-tier players.',
     price: Number(process.env.ADMIN_PRICE) || 1_000_000_000_000, // 1 trillion
+    fixedPrice: true, // doesn't rise with the supply like other items
     roleEnv: 'ADMIN_ROLE_ID',
   },
   salary_raise: {
@@ -458,6 +467,15 @@ if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'bank')
   db.exec('ALTER TABLE users ADD COLUMN bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0)');
 }
 
+// Level of the Week rewards are stored per level and per submission (older rows fall back to stars).
+for (const [table, column, type] of [
+  ['lotw', 'difficulty', 'TEXT'],
+  ['lotw', 'reward_base', 'INTEGER'],
+  ['lotw_subs', 'reward_base', 'INTEGER'],
+]) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
 const q = {
   ensure: db.prepare('INSERT OR IGNORE INTO users (id) VALUES (?)'),
   bal: db.prepare('SELECT balance FROM users WHERE id = ?'),
@@ -537,11 +555,11 @@ const q = {
   seasonTop: db.prepare('SELECT user_id, pts FROM season_points WHERE season = ? ORDER BY pts DESC, user_id LIMIT 10'),
   seasonRank: db.prepare('SELECT COUNT(*) + 1 AS r FROM season_points WHERE season = ? AND pts > ?'),
   getLotw: db.prepare('SELECT * FROM lotw WHERE guild_id = ?'),
-  setLotw: db.prepare('INSERT OR REPLACE INTO lotw (guild_id, level_id, name, stars, ts) VALUES (?, ?, ?, ?, ?)'),
+  setLotw: db.prepare('INSERT OR REPLACE INTO lotw (guild_id, level_id, name, stars, ts, difficulty, reward_base) VALUES (?, ?, ?, ?, ?, ?, ?)'),
   delLotw: db.prepare('DELETE FROM lotw WHERE guild_id = ?'),
   // A rejected clear can be resubmitted; pending or approved ones can't.
-  submitClear: db.prepare(`INSERT INTO lotw_subs (guild_id, level_id, user_id, stars, proof, status, ts) VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    ON CONFLICT(guild_id, level_id, user_id) DO UPDATE SET proof = excluded.proof, stars = excluded.stars, status = 'pending', ts = excluded.ts, reviewer = NULL
+  submitClear: db.prepare(`INSERT INTO lotw_subs (guild_id, level_id, user_id, stars, proof, status, ts, reward_base) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    ON CONFLICT(guild_id, level_id, user_id) DO UPDATE SET proof = excluded.proof, stars = excluded.stars, reward_base = excluded.reward_base, status = 'pending', ts = excluded.ts, reviewer = NULL
     WHERE lotw_subs.status = 'rejected' RETURNING id`),
   getClear: db.prepare('SELECT status FROM lotw_subs WHERE guild_id = ? AND level_id = ? AND user_id = ?'),
   reviewClear: db.prepare("UPDATE lotw_subs SET status = @status, reviewer = @reviewer WHERE id = @id AND status = 'pending' RETURNING *"),
@@ -602,7 +620,8 @@ const mintable = () => Math.max(0, supplyCap() - circulating());
 const payoutMultiplier = () => (SCALE_PAYOUTS ? Math.max(1, supplyCap() / START_SUPPLY) : 1);
 // Prices rise only slowly with the cap, unlike payouts which scale linearly.
 const priceMult = () => 1 + PRICE_SCALE * Math.log2(Math.max(1, supplyCap() / START_SUPPLY));
-const priceOf = (key) => Math.ceil(SHOP[key].price * (SHOP[key].consumable ? payoutMultiplier() : priceMult()));
+const priceOf = (key) =>
+  SHOP[key].fixedPrice ? SHOP[key].price : Math.ceil(SHOP[key].price * (SHOP[key].consumable ? payoutMultiplier() : priceMult()));
 
 // Orbs can only be minted while circulation is below the cap. Returns what was actually granted.
 const mintTx = db.transaction((uid, amount) => {
@@ -1097,10 +1116,16 @@ const commands = [
     .addSubcommand((s) =>
       s
         .setName('set')
-        .setDescription('Feature a level (Manage Server)')
+        .setDescription('Feature a level (Manage Server). Name, stars and difficulty are looked up automatically')
         .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
-        .addStringOption((o) => o.setName('name').setDescription('Level name').setRequired(true))
-        .addIntegerOption((o) => o.setName('stars').setDescription('Star rating; sets the reward').setRequired(true).setMinValue(1).setMaxValue(10))
+        .addStringOption((o) => o.setName('name').setDescription('Override the level name'))
+        .addIntegerOption((o) => o.setName('stars').setDescription('Override the star rating (non-demons pay per star)').setMinValue(1).setMaxValue(10))
+        .addStringOption((o) =>
+          o
+            .setName('difficulty')
+            .setDescription('Override the demon difficulty (demons pay by difficulty)')
+            .addChoices({ name: 'Not a demon', value: 'none' }, ...Object.keys(LOTW_DEMON_REWARDS).map((d) => ({ name: d, value: d })))
+        )
     )
     .addSubcommand((s) => s.setName('end').setDescription('Stop featuring the level (Manage Server)')),
   new SlashCommandBuilder()
@@ -2161,7 +2186,10 @@ async function handleSeason(i) {
 
 /* ───────────── Level of the Week ───────────── */
 
-const lotwReward = (stars) => Math.floor(LOTW_REWARD_PER_STAR * stars * payoutMultiplier());
+const lotwBase = (stars, difficulty) => LOTW_DEMON_REWARDS[difficulty] ?? LOTW_REWARD_PER_STAR * stars;
+// Rows saved before difficulty rewards existed have no reward_base, so fall back to stars.
+const lotwReward = (row) => Math.floor((row.reward_base ?? LOTW_REWARD_PER_STAR * row.stars) * payoutMultiplier());
+const lotwLabel = (row) => (LOTW_DEMON_REWARDS[row.difficulty] ? row.difficulty : `${row.stars}★`);
 const isMod = (i) => i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
 
 /* ───────────── Moderator reviews (by DM) ───────────── */
@@ -2223,11 +2251,20 @@ async function handleLotw(i) {
     if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
     const id = i.options.getString('level_id').trim();
     if (!/^\d{1,12}$/.test(id)) return fail(i, 'Level IDs are numbers, like `128` or `91398357`.');
-    const name = i.options.getString('name').trim().slice(0, 64);
-    const stars = i.options.getInteger('stars');
-    q.setLotw.run(i.guildId, id, name, stars, nowSec());
-    return i.reply({
-      embeds: [embed(`**${name}** (ID \`${id}\`, ${stars}★) is the new Level of the Week!\nBeat it and send proof with \`/lotw submit\` for **${fmt(lotwReward(stars))}** ${ORB}.`, '🎮 Level of the Week')],
+    await i.deferReply();
+    // Fill in whatever the moderator didn't give from the GD servers.
+    const lvl = await fetchJson(`https://gdbrowser.com/api/level/${id}`).catch(() => null);
+    const found = lvl && typeof lvl.name === 'string' ? lvl : null;
+    const name = (i.options.getString('name')?.trim() || found?.name || '').slice(0, 64);
+    const stars = i.options.getInteger('stars') ?? (found?.stars > 0 ? Math.min(10, found.stars) : null);
+    const picked = i.options.getString('difficulty');
+    const difficulty = picked === 'none' ? null : picked ?? (LOTW_DEMON_REWARDS[found?.difficulty] ? found.difficulty : null);
+    if (!name) return fail(i, "I couldn't look that level up on the GD servers. Give its `name` and `stars` (or `difficulty` for a demon).");
+    if (!difficulty && !stars) return fail(i, `**${name}** isn't rated. Give a \`stars\` rating or a demon \`difficulty\` to set the reward.`);
+    const row = { stars: stars ?? 10, difficulty, reward_base: lotwBase(stars ?? 10, difficulty) };
+    q.setLotw.run(i.guildId, id, name, row.stars, nowSec(), difficulty, row.reward_base);
+    return i.editReply({
+      embeds: [embed(`**${name}** (ID \`${id}\`, ${lotwLabel(row)}) is the new Level of the Week!\nBeat it and send proof with \`/lotw submit\` for **${fmt(lotwReward(row))}** ${ORB}.`, '🎮 Level of the Week')],
     });
   }
 
@@ -2247,8 +2284,8 @@ async function handleLotw(i) {
     return i.reply({
       embeds: [
         embed(
-          `**${level.name}** · ID \`${level.level_id}\` · ${level.stars}★\n\nBeat it, then send a screenshot or video with \`/lotw submit\`. ` +
-            `A moderator checks it, and a verified clear pays **${fmt(lotwReward(level.stars))}** ${ORB}.\n\nVerified clears: **${clears}**\n${you}`,
+          `**${level.name}** · ID \`${level.level_id}\` · ${lotwLabel(level)}\n\nBeat it, then send a screenshot or video with \`/lotw submit\`. ` +
+            `A moderator checks it, and a verified clear pays **${fmt(lotwReward(level))}** ${ORB}.\n\nVerified clears: **${clears}**\n${you}`,
           '🎮 Level of the Week'
         ),
       ],
@@ -2258,7 +2295,7 @@ async function handleLotw(i) {
   // submit
   const proof = i.options.getAttachment('proof');
   if (!/^(image|video)\//.test(proof.contentType ?? '')) return fail(i, 'Proof must be a screenshot or a video.');
-  const row = q.submitClear.get(i.guildId, level.level_id, i.user.id, level.stars, proof.url, nowSec());
+  const row = q.submitClear.get(i.guildId, level.level_id, i.user.id, level.stars, proof.url, nowSec(), level.reward_base ?? LOTW_REWARD_PER_STAR * level.stars);
   if (!row) {
     const status = q.getClear.get(i.guildId, level.level_id, i.user.id)?.status;
     return fail(i, status === 'approved' ? 'Your clear of this level is already verified.' : 'Your proof is already waiting for review.');
@@ -2271,7 +2308,7 @@ async function handleLotw(i) {
     new ButtonBuilder().setCustomId(`lotw:approve:${row.id}`).setLabel('Approve').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`lotw:reject:${row.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
   );
-  const e = embed(`${i.user} says they beat **${level.name}** (ID \`${level.level_id}\`, ${level.stars}★).\nReward if approved: **${fmt(lotwReward(level.stars))}** ${ORB}`, '🎮 Clear to review');
+  const e = embed(`${i.user} says they beat **${level.name}** (ID \`${level.level_id}\`, ${lotwLabel(level)}).\nReward if approved: **${fmt(lotwReward(level))}** ${ORB}`, '🎮 Clear to review');
   // Re-upload the proof so it doesn't vanish when Discord's attachment link expires; fall back to the link if it's too big.
   const linkOnly = embed(`${e.data.description}\n\nProof: ${proof.url}`, e.data.title);
   const sent = await sendForReview(
@@ -2309,7 +2346,7 @@ async function handleLotwButton(i) {
     await closeReviews('lotw', id, done, i.message?.id);
     return tellPlayer(row.user_id, 'Your Level of the Week clear was not accepted. You can send new proof with `/lotw submit`.', '🎮 Clear rejected');
   }
-  const granted = mintTx(row.user_id, lotwReward(row.stars));
+  const granted = mintTx(row.user_id, lotwReward(row));
   const notes = afterEarn(row.user_id, row.guild_id, ['lotw'], granted);
   const done = { content: '', embeds: [embed(`<@${row.user_id}>'s clear was approved by ${i.user}. They earned **${fmt(granted)}** ${ORB}.`, '🎮 Clear verified')], components: [] };
   await i.editReply(done);
@@ -2898,7 +2935,7 @@ function helpText(topic) {
       `Beat it within ${RAID_HOURS}h and the reward is split by damage. See \`/raid status\`.\n\n` +
       `**Weekly challenge:** a server-wide goal that changes every Monday. Everyone who helps gets paid when it's done. See \`/weekly\`.\n\n` +
       `**Tournaments:** moderators run trivia tournaments. Answer fast and right to win, and the top 3 split the prize.\n\n` +
-      `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it and you get paid by star rating.`
+      `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it, and you're paid by its rating: per star for normal levels, more for harder demons.`
     );
   }
   if (topic === 'robbery') {
