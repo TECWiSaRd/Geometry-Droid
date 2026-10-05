@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import Database from 'better-sqlite3';
 import {
   Client,
@@ -12,6 +14,9 @@ import {
   ButtonStyle,
   PermissionFlagsBits,
   MessageFlags,
+  StringSelectMenuBuilder,
+  UserSelectMenuBuilder,
+  AttachmentBuilder,
 } from 'discord.js';
 
 /* ───────────── Config ───────────── */
@@ -20,6 +25,28 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID; // optional: instant command updates in one server
 const DB_PATH = process.env.DB_PATH || './data/orbs.db';
 const SALARY_INTERVAL_MIN = Number(process.env.SALARY_INTERVAL_MINUTES) || 60;
+
+// The last few errors and warnings, for /debug logs. They still go to the console as usual.
+const recentLogs = [];
+const BOOT_TIME = Date.now();
+for (const level of ['error', 'warn']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    const show = (a) => {
+      if (a instanceof Error) return a.stack ?? a.message;
+      if (typeof a === 'string') return a;
+      try {
+        return JSON.stringify(a);
+      } catch {
+        return String(a); // e.g. objects that refer to themselves
+      }
+    };
+    const text = args.map(show).join(' ');
+    recentLogs.push(`${new Date().toISOString().slice(5, 19).replace('T', ' ')} ${level === 'warn' ? '⚠️' : '❌'} ${text}`.slice(0, 400));
+    if (recentLogs.length > 25) recentLogs.shift();
+    original(...args);
+  };
+}
 
 console.log('Starting bot…');
 if (!TOKEN) {
@@ -61,6 +88,7 @@ const XP_BASE = 500; // level L begins at XP_BASE * (L-1)^2 xp
 const MAX_PRESTIGE = 10;
 const PRESTIGE_BONUS = 0.02; // +2% earn payouts per prestige
 const DROP_CHANNEL_ID = process.env.DROP_CHANNEL_ID; // optional: where orb drops appear
+const ENGINEER_ROLE_ID = process.env.ENGINEER_ROLE_ID; // optional: members with this role can use /debug
 const DROP_BASE = 1000;
 const DROP_MIN_MINUTES = 20;
 const DROP_MAX_MINUTES = 40;
@@ -1097,6 +1125,22 @@ const commands = [
         .setName('remove')
         .setDescription('Delist a stock and pay holders the last price (Manage Server)')
         .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
+    ),
+  new SlashCommandBuilder()
+    .setName('debug')
+    .setDescription('Open the engineer panel (engineer role only)')
+    .addStringOption((o) =>
+      o
+        .setName('section')
+        .setDescription('Section to open (default: Status)')
+        .addChoices(
+          { name: 'Status', value: 'status' },
+          { name: 'Logs', value: 'logs' },
+          { name: 'Player', value: 'player' },
+          { name: 'Jobs', value: 'jobs' },
+          { name: 'Database', value: 'database' },
+          { name: 'Config', value: 'config' }
+        )
     ),
   new SlashCommandBuilder()
     .setName('drop')
@@ -2854,6 +2898,7 @@ async function stockTick() {
     });
     await announce(lines.join('\n'), '📰 Market news');
   }
+  return { failed, demonlistError };
 }
 
 // Current price, or null while the data is stale (trading pauses).
@@ -3153,6 +3198,7 @@ function helpText(topic) {
       `\`/raid start\`: summon a raid boss in the current channel\n` +
       `\`/tournament\`: run a trivia tournament in the current channel\n` +
       `\`/drop\`: drop an orb right now (in the drop channel, or here if none is set)\n` +
+      `\`/debug\`: engineer tools (needs the role in \`ENGINEER_ROLE_ID\`)\n` +
       `\`/lotw set|end\`: choose the Level of the Week. Clears and stock proposals are sent to every moderator by DM with Approve and Reject buttons\n` +
       `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). \n\n` +
       `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`REVIEW_CHANNEL_ID\` (stock proposals and clears), ` +
@@ -3359,9 +3405,12 @@ async function checkDiscordReachable() {
     });
     const body = (await res.text()).replace(/\s+/g, ' ').slice(0, 400);
     const retry = res.headers.get('retry-after');
-    console.log(`[discord] reachability check: HTTP ${res.status}${retry ? `, retry after ${retry}s` : ''}: ${body}`);
+    const line = `HTTP ${res.status}${retry ? `, retry after ${retry}s` : ''}: ${body}`;
+    console.log(`[discord] reachability check: ${line}`);
+    return line;
   } catch (err) {
     console.error('[discord] reachability check: could not reach discord.com:', err.message);
+    return `could not reach discord.com: ${err.message}`;
   }
 }
 
@@ -3373,6 +3422,13 @@ client.on(Events.InteractionCreate, async (i) => {
         .reply({ content: `🚔 You got caught robbing someone and are banned from the bot until <t:${jailed}:f> (<t:${jailed}:R>).`, flags: EPH })
         .catch(() => {});
     }
+  }
+  if (i.isMessageComponent() && i.customId.startsWith('dbg:')) {
+    return handleDebugComponent(i).catch(async (err) => {
+      console.error(err);
+      const msg = { content: `❌ Something broke: ${err.message}`, flags: EPH };
+      await (i.deferred || i.replied ? i.followUp(msg) : i.reply(msg)).catch(() => {});
+    });
   }
   if (i.isButton()) {
     const handler =
@@ -3434,6 +3490,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleGd(i);
       case 'stock':
         return await handleStock(i);
+      case 'debug':
+        return await handleDebug(i);
       case 'drop':
         return await handleDrop(i);
       case 'rob':
@@ -3494,6 +3552,296 @@ client.on(Events.InteractionCreate, async (i) => {
 });
 
 /* ───────────── Auto payments ───────────── */
+
+/* ───────────── Engineer panel ───────────── */
+
+// /debug opens a private panel. A dropdown switches sections, and buttons run tools. Every click
+// re-checks the engineer role. Nothing here creates orbs or edits balances.
+const isEngineer = (i) => !!ENGINEER_ROLE_ID && !!i.member?.roles?.cache?.has(ENGINEER_ROLE_ID);
+const ago = (sec) => (sec < 120 ? `${sec}s` : sec < 7200 ? `${Math.round(sec / 60)}m` : `${(sec / 3600).toFixed(1)}h`);
+const mb = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+const dbBytes = () => ['', '-wal'].reduce((n, ext) => n + (fs.existsSync(DB_PATH + ext) ? fs.statSync(DB_PATH + ext).size : 0), 0);
+const MAX_BACKUP_BYTES = 9.5 * 1024 * 1024; // Discord's upload limit for bots is 10 MB
+
+// How long the bot takes to get back to waiting work (high = something is blocking it).
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+
+const DEBUG_SECTIONS = {
+  status: '📊 Status',
+  logs: '📜 Logs',
+  player: '👤 Player',
+  jobs: '⚙️ Jobs',
+  database: '🗄️ Database',
+  config: '🔧 Config',
+};
+const dbgButton = (id, label, style = ButtonStyle.Secondary) => new ButtonBuilder().setCustomId(`dbg:${id}`).setLabel(label).setStyle(style);
+const sectionMenu = (active) =>
+  new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('dbg:section')
+      .setPlaceholder('Choose a section')
+      .addOptions(Object.entries(DEBUG_SECTIONS).map(([value, label]) => ({ label, value, default: value === active })))
+  );
+
+function statusText(guildId) {
+  const now = nowSec();
+  const nextDrop = Number(q.getMeta.get('drop_next')?.value ?? 0);
+  const raid = q.getRaid.get(guildId);
+  const raidNext = Number(q.getMeta.get(`raid_next:${guildId}`)?.value ?? 0);
+  const stocks = q.listedStocks.all();
+  const ages = stocks.map((st) => ({ sym: st.sym, age: now - (q.lastPrice.get(st.sym)?.ts ?? 0) }));
+  const stale = ages.filter((a) => a.age > STOCK_STALE_MINUTES * 60).map((a) => a.sym);
+  const season = seasonIndex();
+  const mem = process.memoryUsage();
+  const lagMean = (loopDelay.mean / 1e6).toFixed(1);
+  const lagMax = (loopDelay.max / 1e6).toFixed(0);
+  loopDelay.reset();
+  return [
+    `**Bot**`,
+    `Commit \`${process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ?? 'unknown'}\` · up ${ago(Math.floor((Date.now() - BOOT_TIME) / 1000))} · Node ${process.version}`,
+    `Discord: ${client.isReady() ? 'connected' : 'not ready'}, ping ${client.ws.ping}ms · ${client.guilds.cache.size} server(s)`,
+    `Memory ${mb(mem.rss)} (heap ${mb(mem.heapUsed)}) · responsiveness: avg ${lagMean}ms, worst ${lagMax}ms`,
+    `Database ${mb(dbBytes())} · ${recentLogs.length} recent errors/warnings`,
+    '',
+    `**Economy**`,
+    `Supply cap ${fmt(supplyCap())} · circulating ${fmt(circulating())} · payout multiplier x${payoutMultiplier().toFixed(2)}`,
+    '',
+    `**Systems**`,
+    `Orb drops: ${DROP_CHANNEL_ID ? `on in <#${DROP_CHANNEL_ID}>, next <t:${nextDrop}:R>, ${activeDrops.size} live` : 'off (no DROP_CHANNEL_ID)'}`,
+    `Raid: ${raid ? `${raid.boss} ${fmt(raid.hp)}/${fmt(raid.max_hp)} HP, ends <t:${raid.ends}:R>` : EVENT_CHANNEL_ID ? `none, next <t:${raidNext}:R>` : 'off (no EVENT_CHANNEL_ID)'}`,
+    `Stocks: ${stocks.length} listed${ages.length ? `, newest data ${ago(Math.min(...ages.map((a) => a.age)))} old` : ''}${stale.length ? `, paused: ${stale.join(', ')}` : ''}`,
+    `Season ${season}, ends <t:${seasonEnd(season)}:R>`,
+    `In progress: ${pending.size} bot checks, ${robberies.size} robberies, ${tournaments.size} tournaments`,
+  ].join('\n');
+}
+
+function playerText(uid) {
+  const now = nowSec();
+  const u = db.prepare('SELECT balance, bank, total_earned FROM users WHERE id = ?').get(uid) ?? { balance: 0, bank: 0, total_earned: 0 };
+  const { xp, prestige } = progressOf(uid);
+  const strike = getStrike(uid);
+  const effects = ['jail', 'speed', 'padlock', 'rob_shield']
+    .map((b) => [b, q.getBuff.get(uid, b)?.until ?? 0])
+    .filter(([, until]) => until > now)
+    .map(([b, until]) => `${b} until <t:${until}:R>`);
+  const used = db
+    .prepare('SELECT action, ts FROM cooldowns WHERE user_id = ? ORDER BY ts DESC')
+    .all(uid)
+    .map((c) => `${c.action} ${ago(now - c.ts)} ago`);
+  const items = q.inventory.all(uid).map((r) => `${r.item} ×${r.qty}`);
+  const shares = q.holdings.all(uid).map((h) => `${h.sym} ×${fmt(h.shares)}`);
+  const clan = q.clanOf.get(uid);
+  const link = q.getLink.get(uid);
+  return [
+    `<@${uid}> · \`${uid}\``,
+    `Wallet ${fmt(u.balance)} · bank ${fmt(u.bank)} · earned ${fmt(u.total_earned)}`,
+    `XP ${fmt(xp)} (level ${levelOf(xp)}) · prestige ${prestige} · badges ${q.userAchs.all(uid).length}/${ACHIEVEMENTS.length}`,
+    `Bot-check fails ${strike.fails}, streak ${strike.streak}${strike.locked_until > now ? `, locked until <t:${strike.locked_until}:R>` : ''}`,
+    `Effects: ${effects.join(', ') || 'none'}`,
+    `Last used: ${used.join(', ') || 'nothing'}`,
+    `Items: ${items.join(', ') || 'none'} · Shares: ${shares.join(', ') || 'none'}`,
+    `Clan: ${clan ? `${clan.name} (level ${clan.level})` : 'none'} · GD: ${link ? `${link.username}${link.verified ? '' : ' (unverified)'}` : 'not linked'}`,
+  ].join('\n');
+}
+
+function databaseText() {
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    .all()
+    .map(({ name }) => [name, db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get().n])
+    .sort((a, b) => b[1] - a[1]);
+  const wal = fs.existsSync(`${DB_PATH}-wal`) ? fs.statSync(`${DB_PATH}-wal`).size : 0;
+  return [
+    `File \`${DB_PATH}\` · ${mb(dbBytes())} (write-ahead log ${mb(wal)})`,
+    '',
+    '**Rows per table**',
+    tables.map(([name, n]) => `${name}: ${fmt(n)}`).join('\n'),
+  ].join('\n');
+}
+
+function configText() {
+  const id = (v, kind) => (v ? `${kind === 'role' ? `<@&${v}>` : `<#${v}>`} (\`${v}\`)` : '—');
+  const val = (v) => (v ? `\`${v}\`` : '—');
+  const secret = (v) => (v ? 'set (hidden)' : '—');
+  const env = process.env;
+  return [
+    `DISCORD_TOKEN: ${secret(env.DISCORD_TOKEN)}`,
+    `GUILD_ID: ${val(env.GUILD_ID)}`,
+    `DB_PATH: ${val(DB_PATH)}`,
+    `SALARY_INTERVAL_MINUTES: ${SALARY_INTERVAL_MIN}`,
+    `DROP_CHANNEL_ID: ${id(env.DROP_CHANNEL_ID)}`,
+    `EVENT_CHANNEL_ID: ${id(env.EVENT_CHANNEL_ID)}`,
+    `REVIEW_CHANNEL_ID: ${id(env.REVIEW_CHANNEL_ID)}`,
+    `LOTW_REVIEW_CHANNEL_ID: ${id(env.LOTW_REVIEW_CHANNEL_ID)}`,
+    `IMAGE_ROLE_ID: ${id(env.IMAGE_ROLE_ID, 'role')}`,
+    `ADMIN_ROLE_ID: ${id(env.ADMIN_ROLE_ID, 'role')}`,
+    `SEASON_ROLE_ID: ${id(env.SEASON_ROLE_ID, 'role')}`,
+    `ENGINEER_ROLE_ID: ${id(env.ENGINEER_ROLE_ID, 'role')}`,
+    `ADMIN_PRICE: ${val(env.ADMIN_PRICE)}`,
+    `ORB_EMOJI: ${env.ORB_EMOJI ? ORB : `default ${ORB}`}`,
+    `GITHUB_TOKEN: ${secret(env.GITHUB_TOKEN)} · CHANGELOG_REPO: ${val(CHANGELOG_REPO)}`,
+    `DEBUG_DISCORD: ${val(env.DEBUG_DISCORD)}`,
+  ].join('\n');
+}
+
+// Builds a panel page. `extra.result` shows the outcome of the last action.
+function debugPage(section, guildId, extra = {}) {
+  const rows = [sectionMenu(section)];
+  let text;
+  if (section === 'logs') {
+    text = recentLogs.length ? `\`\`\`\n${recentLogs.join('\n').slice(-3800)}\n\`\`\`` : 'No errors or warnings since the last restart.';
+    rows.push(new ActionRowBuilder().addComponents(dbgButton('go:logs', 'Refresh'), dbgButton('logs:clear', 'Clear', ButtonStyle.Danger)));
+  } else if (section === 'player') {
+    text = extra.uid ? playerText(extra.uid) : 'Pick a member below to see their data.';
+    rows.push(new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId('dbg:user').setPlaceholder('Pick a member')));
+    if (extra.uid) {
+      rows.push(
+        new ActionRowBuilder().addComponents(
+          dbgButton(`unban:${extra.uid}`, 'Unban (robbery + bot check)'),
+          dbgButton(`cds:${extra.uid}`, 'Reset cooldowns'),
+          dbgButton(`player:${extra.uid}`, 'Refresh')
+        )
+      );
+    }
+  } else if (section === 'jobs') {
+    text =
+      'Run a job now:\n' +
+      '**Drop** posts an orb drop · **Raid** spawns a boss if none is active · **Stocks** updates prices\n' +
+      '**Discord** checks the connection and login limit · **Data sources** times GDBrowser and Pointercrate · **Commands** re-registers slash commands';
+    rows.push(
+      new ActionRowBuilder().addComponents(dbgButton('job:drop', 'Drop'), dbgButton('job:raid', 'Raid'), dbgButton('job:stocks', 'Stocks')),
+      new ActionRowBuilder().addComponents(dbgButton('job:discord', 'Discord'), dbgButton('job:sources', 'Data sources'), dbgButton('job:commands', 'Commands'))
+    );
+  } else if (section === 'database') {
+    text = databaseText();
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        dbgButton('db:check', 'Integrity check'),
+        dbgButton('db:checkpoint', 'Tidy up log file'),
+        dbgButton('db:backup', 'Download backup', ButtonStyle.Primary)
+      )
+    );
+  } else if (section === 'config') {
+    text = configText();
+  } else {
+    section = 'status';
+    text = statusText(guildId);
+    rows.push(new ActionRowBuilder().addComponents(dbgButton('go:status', 'Refresh')));
+  }
+  const result = extra.result ? `\n\n**Result**\n${extra.result}` : '';
+  return { embeds: [embed(`${text}${result}`.slice(0, 4000), `🛠️ Engineer panel · ${DEBUG_SECTIONS[section]}`)], components: rows };
+}
+
+async function timedFetch(url, timeoutMs) {
+  const start = Date.now();
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': 'gd-orbs-bot (Discord economy bot)' }, signal: AbortSignal.timeout(timeoutMs) });
+    return `HTTP ${res.status} in ${Date.now() - start}ms`;
+  } catch (err) {
+    return err.name === 'TimeoutError' ? `timed out after ${timeoutMs / 1000}s` : err.message;
+  }
+}
+
+async function runJob(job, guildId) {
+  if (job === 'drop') {
+    if (!DROP_CHANNEL_ID) return 'Orb drops are off (no `DROP_CHANNEL_ID`). Use `/drop` to drop one in a channel.';
+    q.setMeta.run('drop_next', String(nowSec()));
+    await dropTick();
+    return 'Ran the orb drop job. If nothing appeared, check Logs.';
+  }
+  if (job === 'raid') {
+    if (q.getRaid.get(guildId)) return 'A raid is already active.';
+    if (!EVENT_CHANNEL_ID) return 'Raids need `EVENT_CHANNEL_ID`. Use `/raid start` to start one in a channel.';
+    q.setMeta.run(`raid_next:${guildId}`, String(nowSec()));
+    await raidTick();
+    return q.getRaid.get(guildId) ? '⚔️ A raid boss spawned.' : 'No raid spawned. Check Logs.';
+  }
+  if (job === 'stocks') {
+    const { failed, demonlistError } = await stockTick();
+    const lines = [demonlistError && `Demonlist (Pointercrate): ${demonlistError}`, failed.length && `Kept their last price: ${failed.join(', ')}`].filter(Boolean);
+    return lines.length ? `Updated, with problems:\n${lines.join('\n')}` : 'Updated every stock.';
+  }
+  if (job === 'discord') return `Discord: ${await checkDiscordReachable()}`;
+  if (job === 'sources') {
+    const [gd, pc] = await Promise.all([
+      timedFetch('https://gdbrowser.com/api/level/10565740', 15_000),
+      timedFetch('https://pointercrate.com/api/v1/players/ranking/?limit=1', 30_000),
+    ]);
+    return `GDBrowser: ${gd}\nPointercrate: ${pc}`;
+  }
+  // commands
+  if (GUILD_ID) {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    await guild.commands.set(commands);
+  } else {
+    await client.application.commands.set(commands);
+  }
+  return `Re-registered ${commands.length} slash commands.`;
+}
+
+async function handleDebug(i) {
+  if (!isEngineer(i)) return fail(i, ENGINEER_ROLE_ID ? 'Only engineers can use this.' : 'The engineer panel is off. Set `ENGINEER_ROLE_ID` to turn it on.');
+  return i.reply({ ...debugPage(i.options.getString('section') ?? 'status', i.guildId), flags: EPH });
+}
+
+async function handleDebugComponent(i) {
+  if (!isEngineer(i)) return i.reply({ content: '❌ Only engineers can use this.', flags: EPH });
+  const [, kind, arg] = i.customId.split(':');
+  const show = (section, extra) => i.update(debugPage(section, i.guildId, extra));
+  const audit = (what) => console.warn(`[debug] ${i.user.username ?? i.user.id} ${what}`);
+
+  if (kind === 'section') return show(i.values[0]);
+  if (kind === 'go') return show(arg);
+  if (kind === 'user') return show('player', { uid: i.values[0] });
+  if (kind === 'player') return show('player', { uid: arg });
+  if (kind === 'unban') {
+    q.setBuff.run(arg, 'jail', 0);
+    saveStrike(arg, { ...getStrike(arg), fails: 0, locked_until: 0 });
+    audit(`cleared bans for ${arg}`);
+    return show('player', { uid: arg, result: 'Cleared any robbery ban and bot-check lockout.' });
+  }
+  if (kind === 'cds') {
+    db.prepare('DELETE FROM cooldowns WHERE user_id = ?').run(arg);
+    audit(`reset cooldowns for ${arg}`);
+    return show('player', { uid: arg, result: 'Reset every cooldown (earn commands and /rob).' });
+  }
+  if (kind === 'logs') {
+    recentLogs.length = 0;
+    return show('logs');
+  }
+
+  // Jobs and database tools can take a while, so acknowledge first.
+  await i.deferUpdate();
+  if (kind === 'job') {
+    const result = await runJob(arg, i.guildId).catch((err) => `Failed: ${err.message}`);
+    return i.editReply(debugPage('jobs', i.guildId, { result }));
+  }
+  if (arg === 'check') {
+    const rows = db.pragma('quick_check');
+    const ok = rows.length === 1 && rows[0].quick_check === 'ok';
+    return i.editReply(debugPage('database', i.guildId, { result: ok ? '✅ The database is healthy.' : `❌ Problems found:\n${rows.map((r) => r.quick_check).join('\n').slice(0, 1500)}` }));
+  }
+  if (arg === 'checkpoint') {
+    const [r] = db.pragma('wal_checkpoint(TRUNCATE)');
+    return i.editReply(debugPage('database', i.guildId, { result: `Moved ${fmt(r.checkpointed)} pending pages into the main file and emptied the write-ahead log.` }));
+  }
+  // backup: a consistent copy, even while the bot keeps writing
+  const file = path.join(os.tmpdir(), `orbs-backup-${Date.now()}.db`);
+  try {
+    await db.backup(file);
+    const size = fs.statSync(file).size;
+    if (size > MAX_BACKUP_BYTES) {
+      return i.editReply(debugPage('database', i.guildId, { result: `The backup is ${mb(size)}, over Discord's 10 MB upload limit. Use \`railway ssh\` to copy it instead.` }));
+    }
+    const name = `orbs-backup-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.db`;
+    await i.followUp({ content: `🗄️ Database backup (${mb(size)}). It contains every player's data, so keep it private.`, files: [new AttachmentBuilder(file, { name })], flags: EPH });
+    audit('downloaded a database backup');
+    return i.editReply(debugPage('database', i.guildId, { result: `Sent you a backup (${mb(size)}).` }));
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+}
 
 async function salaryTick() {
   const now = nowSec();

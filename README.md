@@ -27,6 +27,7 @@ Geometry Dash themed Discord economy bot.
 - `/bank view|deposit|withdraw`: banked orbs can't be robbed. Space is 10,000 per level (scales with payouts). Banked orbs still count toward circulation and `/leaderboard`. The 🛡️ Padlock consumable (1,500, scales with payouts, 2 per day) guards your wallet for 24h; the next robber is caught
 - `/gd link username`, `/gd verify`, `/gd profile [user]`, `/gd unlink`: link your Geometry Dash account. The bot gives you a code to post as a profile post on your GD account, then `/gd verify` checks it (you can delete the post afterwards). One GD account per member
 - `/drop` (Manage Server): drop an orb right now, in the drop channel or the current one
+- `/debug [section]` (members with the `ENGINEER_ROLE_ID` role): opens a private engineer panel. A dropdown switches between **Status** (commit, uptime, Discord connection, memory, responsiveness, economy and every system), **Logs** (last 25 errors/warnings, clearable), **Player** (pick a member to see their raw data; Unban and Reset cooldowns buttons), **Jobs** (run a drop, raid spawn or stock update; check the Discord connection; time GDBrowser and Pointercrate; re-register slash commands), **Database** (size and rows per table, integrity check, tidy the write-ahead log, and **download a backup** sent privately as a file if it's under 10 MB) and **Config** (which Railway variables are set; secrets hidden). Nothing in the panel creates orbs or edits balances
 - `/salary set|remove|list` (Manage Server): automatic role payments
 
 ## Discord setup
@@ -60,6 +61,7 @@ SALARY_INTERVAL_MINUTES=60
 # LOTW_REVIEW_CHANNEL_ID=channel-id   fallback for Level of the Week proofs (defaults to REVIEW_CHANNEL_ID, then the channel used)
 # SEASON_ROLE_ID=role-id              given to each season's #1 (the bot's role must be above it)
 # GITHUB_TOKEN=token                  only needed for /changelog if the repo is private
+# ENGINEER_ROLE_ID=role-id            members with this role can use /debug
 ```
 
 The bot needs View Channel, Send Messages, Embed Links and Attach Files in the drop, event and review channels.
