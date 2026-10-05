@@ -136,6 +136,9 @@ const DEFAULT_STOCKS = {
 const STOCK_MAX = 20; // listed stocks at once (each is one GDBrowser request per update)
 const STOCK_MIN_DOWNLOADS = 1_000_000; // proposed levels need this many, so a few alts can't move the price
 const STOCK_WARMUP_HOURS = 36; // new listings collect data this long before trading opens
+// /stock propose needs a verified GD account (/gd link) with either of these. Harder demons count too.
+const PROPOSE_MIN_MEDIUM = 5; // Medium Demons or harder
+const PROPOSE_MIN_HARD = 2; // ...or Hard Demons or harder
 const MAX_REVIEW_DMS = 25; // review requests go to at most this many moderators by DM
 const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID || LOTW_REVIEW_CHANNEL_ID; // where stock proposals go; also clears if LOTW_REVIEW_CHANNEL_ID isn't set
 const STOCK_BASE = 1_000; // price at a stock's usual level. Fixed, so holding doesn't ride payout growth for free
@@ -236,6 +239,16 @@ const ACTIONS = {
       'You moderated the level rating queue',
       'You synced a song to a Stereo Madness remake',
       'You designed a portal for a Hall of Fame level',
+      'You playtested a new Gauntlet before release',
+      'You fixed a collision bug in a Spider portal',
+      'You reviewed sends for the Weekly Demon',
+      'You balanced the orb rewards for a new Map Pack',
+      'You helped RobTop name a new icon',
+      'You checked the Daily Level for secret way skips',
+      'You wrote the hints for the Treasure Room',
+      'You tuned a 4x speed portal section',
+      'You cleared out the bug reports in the Vault',
+      'You recorded a showcase for the Featured tab',
     ],
   },
   build: {
@@ -253,6 +266,16 @@ const ACTIONS = {
       'You layered a glowing deco section around a spike pit',
       'You finished a collab part and got paid',
       'You built a Mega Collab segment',
+      'You built a Wave corridor so tight it hurts',
+      'You gave the Stereo Madness layout a 2.2 makeover',
+      'You placed 10,000 objects with only two editor crashes',
+      'You built a boss fight out of Move and Spawn triggers',
+      'You finished the drop section of a Megacollab',
+      'You hid a Secret Coin behind a fake wall',
+      'You built a Ship section with perfectly synced orbs',
+      'You built a platformer checkpoint room',
+      'You decorated a level in glowing neon blocks',
+      'You synced a three-minute drop to the music',
     ],
   },
   fish: {
@@ -270,6 +293,16 @@ const ACTIONS = {
       'You reeled in a school of tiny orbs',
       'You caught a glowing orb near the Treasure Room',
       'You fished beside the Secret Vault',
+      'You pulled a toasty orb out of the Lava Pit',
+      'You reeled in an orb from the bottom of a Wave corridor',
+      'You fished up a Gold Key fragment to trade',
+      'You caught a school of orbs swimming through a Gravity portal',
+      "You cast your line past the Keymaster's Basement",
+      'You fished beside the Shopkeeper until he paid you to leave',
+      'You caught an orb hiding behind a fake spike',
+      "You fished in the Chamber of Time and caught yesterday's orb",
+      'You hooked an orb riding a Jump Pad',
+      'You fished through a Mirror portal and caught an orb backwards',
     ],
   },
   mine: {
@@ -287,6 +320,16 @@ const ACTIONS = {
       'You mined orbs out of the Demon Guardian\'s lair',
       'You cracked open a Gold Chest full of orbs',
       'You mined in the Treasure Room with the Keymaster',
+      'You mined through a wall of Demon Keys',
+      'You tunneled under the Secret Shop',
+      'You struck a vein of diamonds in the Tower',
+      "You dug up a buried chest in the Wraith's Vault",
+      "You mined beneath a Hall of Fame level's foundations",
+      'You found orbs stuck between two overlapping blocks',
+      'You mined in the dark with only a glowing orb for light',
+      'You blasted through a Gauntlet wall',
+      'You mined the bedrock under Deadlocked',
+      'You cracked open a Diamond Chest with your pickaxe',
     ],
   },
   quiz: {
@@ -303,6 +346,16 @@ const ACTIONS = {
       'You aced a Geometry Dash quiz',
       'You knew the answer to a level history question',
       'You remembered the official level order',
+      'You knew every portal by heart',
+      'You answered faster than a 4x speed portal',
+      'You out-quizzed a Demonlist player',
+      'You aced the trigger exam',
+      'You named every Map Pack in order',
+      'You recognized a level from a single screenshot',
+      'You recited the official level order backwards',
+      'You answered before the music even dropped',
+      'You impressed the Keymaster with your knowledge',
+      'You got a perfect score on the Geometry Dash final',
     ],
   },
 };
@@ -449,6 +502,10 @@ CREATE TABLE IF NOT EXISTS review_msgs (
   kind TEXT NOT NULL, ref TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
   PRIMARY KEY (kind, ref, message_id)
 );
+CREATE TABLE IF NOT EXISTS gd_links (
+  user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, username TEXT NOT NULL,
+  code TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, ts INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS stocks (
   sym TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
   status TEXT NOT NULL, proposer TEXT, listed_at INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
@@ -576,6 +633,11 @@ const q = {
   addReviewMsg: db.prepare('INSERT OR IGNORE INTO review_msgs (kind, ref, channel_id, message_id) VALUES (?, ?, ?, ?)'),
   reviewMsgs: db.prepare('SELECT channel_id, message_id FROM review_msgs WHERE kind = ? AND ref = ?'),
   delReviewMsgs: db.prepare('DELETE FROM review_msgs WHERE kind = ? AND ref = ?'),
+  getLink: db.prepare('SELECT * FROM gd_links WHERE user_id = ?'),
+  setLink: db.prepare('INSERT OR REPLACE INTO gd_links (user_id, account_id, username, code, verified, ts) VALUES (?, ?, ?, ?, 0, ?)'),
+  verifyLink: db.prepare('UPDATE gd_links SET verified = 1 WHERE user_id = ?'),
+  linkedElsewhere: db.prepare('SELECT user_id FROM gd_links WHERE account_id = ? AND verified = 1 AND user_id != ?'),
+  delLink: db.prepare('DELETE FROM gd_links WHERE user_id = ?'),
   insertStock: db.prepare('INSERT INTO stocks (sym, name, kind, ref_id, status, proposer, listed_at, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
   stockBySym: db.prepare('SELECT * FROM stocks WHERE sym = ?'),
   stockByRef: db.prepare('SELECT * FROM stocks WHERE kind = ? AND ref_id = ?'),
@@ -988,6 +1050,13 @@ const commands = [
   new SlashCommandBuilder().setName('inventory').setDescription('Your potions, active effects and tools'),
   new SlashCommandBuilder().setName('stocks').setDescription('Stock prices, driven by real Geometry Dash stats'),
   new SlashCommandBuilder()
+    .setName('gd')
+    .setDescription('Link your Geometry Dash account')
+    .addSubcommand((s) => s.setName('link').setDescription('Start linking your GD account').addStringOption((o) => o.setName('username').setDescription('Your GD username').setRequired(true)))
+    .addSubcommand((s) => s.setName('verify').setDescription('Finish linking after posting your code on your GD profile'))
+    .addSubcommand((s) => s.setName('profile').setDescription('See a linked GD account').addUserOption((o) => o.setName('user').setDescription('Someone else')))
+    .addSubcommand((s) => s.setName('unlink').setDescription('Remove your GD account link')),
+  new SlashCommandBuilder()
     .setName('stock')
     .setDescription('Trade stocks or look one up')
     .addSubcommand((s) =>
@@ -1029,6 +1098,10 @@ const commands = [
         .setDescription('Delist a stock and pay holders the last price (Manage Server)')
         .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
     ),
+  new SlashCommandBuilder()
+    .setName('drop')
+    .setDescription('Drop an orb right now (Manage Server)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName('rob')
     .setDescription(`Steal from someone's wallet (${ROB_SUCCESS * 100}% chance; caught = fine + ${ROB_JAIL / 3600}h ban)`)
@@ -2563,6 +2636,100 @@ async function stockAutocomplete(i) {
 }
 
 // Looks a level up on GDBrowser and checks it can be listed.
+/* ───────────── Geometry Dash account links ───────────── */
+
+async function gdProfile(name) {
+  const p = await fetchJson(`https://gdbrowser.com/api/profile/${encodeURIComponent(name)}`).catch(() => null);
+  return p && p.accountID ? p : null;
+}
+
+// Classic and platformer demons, by difficulty.
+function demonCounts(p) {
+  const n = (k) => (p.classicDemonsCompleted?.[k] ?? 0) + (p.platformerDemonsCompleted?.[k] ?? 0);
+  return { easy: n('easy'), medium: n('medium'), hard: n('hard'), insane: n('insane'), extreme: n('extreme') };
+}
+const hardPlus = (d) => d.hard + d.insane + d.extreme;
+const mediumPlus = (d) => d.medium + hardPlus(d);
+const canPropose = (d) => mediumPlus(d) >= PROPOSE_MIN_MEDIUM || hardPlus(d) >= PROPOSE_MIN_HARD;
+const demonLine = (d) => `Easy ${d.easy} · Medium ${d.medium} · Hard ${d.hard} · Insane ${d.insane} · Extreme ${d.extreme}`;
+const requirementText = `at least ${PROPOSE_MIN_MEDIUM} Medium Demons or ${PROPOSE_MIN_HARD} Hard Demons (harder demons count too)`;
+
+// Returns an error message if the player can't propose stocks, or null if they can.
+async function proposeBlocker(uid) {
+  const link = q.getLink.get(uid);
+  if (!link?.verified) return `To propose stocks, link your Geometry Dash account with \`/gd link\`. You need ${requirementText}.`;
+  const p = await gdProfile(link.username);
+  if (!p) return "I couldn't reach the GD servers to check your demons. Try again in a bit.";
+  if (String(p.accountID) !== link.account_id) return 'Your linked GD account changed its name. Link it again with `/gd link`.';
+  const d = demonCounts(p);
+  if (!canPropose(d)) return `Proposing stocks needs ${requirementText}. You have ${mediumPlus(d)} Medium or harder and ${hardPlus(d)} Hard or harder.`;
+  return null;
+}
+
+async function handleGd(i) {
+  const sub = i.options.getSubcommand();
+  const uid = i.user.id;
+
+  if (sub === 'link') {
+    await i.deferReply({ flags: EPH });
+    const p = await gdProfile(i.options.getString('username').trim());
+    if (!p) return fail(i, "I couldn't find that Geometry Dash account. Check the spelling, or try again if the GD servers are slow.");
+    if (q.linkedElsewhere.get(String(p.accountID), uid)) return fail(i, `**${p.username}** is already linked to another member.`);
+    const code = `ORBS-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    q.setLink.run(uid, String(p.accountID), p.username, code, nowSec());
+    return i.editReply({
+      embeds: [
+        embed(
+          `To prove **${p.username}** is yours:\n\n1. In Geometry Dash, open your profile and post this as a profile post:\n\`\`\`${code}\`\`\`\n2. Run \`/gd verify\`.\n\nYou can delete the post once you're verified.`,
+          '🔗 Link your GD account'
+        ),
+      ],
+    });
+  }
+
+  if (sub === 'verify') {
+    const link = q.getLink.get(uid);
+    if (!link) return fail(i, 'Start with `/gd link username`.');
+    if (link.verified) return fail(i, `You're already verified as **${link.username}**.`);
+    await i.deferReply({ flags: EPH });
+    const posts = await fetchJson(`https://gdbrowser.com/api/comments/${link.account_id}?type=profile&count=10`).catch(() => null);
+    if (!Array.isArray(posts)) return fail(i, "I couldn't read your profile posts. If you just posted the code, give it a minute and try again.");
+    if (!posts.some((p) => String(p.content ?? '').includes(link.code))) {
+      return fail(i, `I couldn't find \`${link.code}\` in **${link.username}**'s latest profile posts yet. Post it, wait a minute, then try again.`);
+    }
+    if (q.linkedElsewhere.get(link.account_id, uid)) return fail(i, `**${link.username}** was just linked to another member.`);
+    q.verifyLink.run(uid);
+    const p = await gdProfile(link.username);
+    const d = p ? demonCounts(p) : null;
+    const status = d ? `\n\nDemons: ${demonLine(d)}\n${canPropose(d) ? '✅ You can propose stocks.' : `You can propose stocks once you have ${requirementText}.`}` : '';
+    return i.editReply({ embeds: [embed(`You're verified as **${link.username}**. You can delete the profile post now.${status}`, '🔗 GD account linked')] });
+  }
+
+  if (sub === 'unlink') {
+    if (!q.getLink.get(uid)) return fail(i, "You haven't linked a GD account.");
+    q.delLink.run(uid);
+    return i.reply({ content: '🔗 Your GD account was unlinked.', flags: EPH });
+  }
+
+  // profile
+  const user = i.options.getUser('user') ?? i.user;
+  const link = q.getLink.get(user.id);
+  if (!link?.verified) return i.reply({ embeds: [embed(`${user} hasn't linked a verified GD account. Use \`/gd link\`.`, '🔗 GD account')] });
+  await i.deferReply();
+  const p = await gdProfile(link.username);
+  if (!p) return i.editReply({ embeds: [embed(`${user} is **${link.username}** on Geometry Dash. (Couldn't reach the GD servers for stats right now.)`, '🔗 GD account')] });
+  const d = demonCounts(p);
+  return i.editReply({
+    embeds: [
+      embed(
+        `${user} is **${p.username}** on Geometry Dash.\n⭐ ${fmt(p.stars ?? 0)} stars · 😈 ${fmt(p.demons ?? 0)} demons\nDemons: ${demonLine(d)}\n\n` +
+          (canPropose(d) ? '✅ Can propose stocks.' : `Can propose stocks with ${requirementText}.`),
+        '🔗 GD account'
+      ),
+    ],
+  });
+}
+
 // `allowPending` lets moderators list a level that is still waiting for approval.
 async function checkLevel(id, { allowPending = false } = {}) {
   if (!/^\d{1,12}$/.test(id)) return { error: 'Level IDs are numbers, like \`10565740\`.' };
@@ -2736,6 +2903,10 @@ async function handleStock(i) {
     if (custom && !/^[A-Z][A-Z0-9]{1,4}$/.test(custom)) return fail(i, 'Symbols are 2-5 letters or numbers, starting with a letter.');
     if (custom && custom !== pending?.sym && q.stockBySym.get(custom)) return fail(i, `**${custom}** is already taken.`);
     await i.deferReply({ flags: EPH });
+    if (sub === 'propose' && !isMod(i)) {
+      const blocked = await proposeBlocker(uid);
+      if (blocked) return fail(i, blocked);
+    }
     const { lvl, error } = await checkLevel(id, { allowPending: sub === 'add' });
     if (error) return fail(i, error);
     const sym = custom ?? pending?.sym ?? makeSymbol(lvl.name);
@@ -2961,7 +3132,8 @@ function helpText(topic) {
       `**Level stocks** (${levels}) rise when the level gets played more than usual. The price compares its downloads in the last 24h with its average day.\n\n` +
       `**Player stocks** (${players}) follow that player's Demonlist score, so they jump when the player beats a new demon.\n\n` +
       `A stock at its usual level is worth about **${fmt(STOCK_BASE)}** ${ORB}. \`/stocks\` shows prices, \`/stock buy\` and \`/stock sell\` trade (${STOCK_FEE * 100}% fee each way), and \`/portfolio\` shows your profit or loss.\n\n` +
-      `**Want another level?** \`/stock propose level_id\` suggests any level with ${fmt(STOCK_MIN_DOWNLOADS)}+ downloads. If a moderator approves it, it trades after ${STOCK_WARMUP_HOURS}h of data.\n\n` +
+      `**Want another level?** \`/stock propose level_id\` suggests any level with ${fmt(STOCK_MIN_DOWNLOADS)}+ downloads. If a moderator approves it, it trades after ${STOCK_WARMUP_HOURS}h of data. ` +
+      `To propose, link your GD account with \`/gd link\` and have ${requirementText}.\n\n` +
       `If the data for a stock stops updating, trading on it pauses until it's back. Big moves are announced in the event channel.`
     );
   }
@@ -2971,6 +3143,7 @@ function helpText(topic) {
       `\`/salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
       `\`/raid start\`: summon a raid boss in the current channel\n` +
       `\`/tournament\`: run a trivia tournament in the current channel\n` +
+      `\`/drop\`: drop an orb right now (in the drop channel, or here if none is set)\n` +
       `\`/lotw set|end\`: choose the Level of the Week. Clears and stock proposals are sent to every moderator by DM with Approve and Reject buttons\n` +
       `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). \n\n` +
       `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`REVIEW_CHANNEL_ID\` (stock proposals and clears), ` +
@@ -3003,11 +3176,10 @@ const handleHelpButton = (i) => i.update(helpPage(HELP_TOPICS[i.customId.split('
 /* ───────────── Orb drops ───────────── */
 
 const activeDrops = new Map(); // dropId -> { seq, prize, title, msg, timer }
-let nextDropAt = 0;
 
 // Live drop messages are remembered in meta so a restart can close them out.
 const saveDropRefs = () =>
-  q.setMeta.run('active_drops', JSON.stringify([...activeDrops.values()].map((d) => ({ channelId: DROP_CHANNEL_ID, messageId: d.msg.id }))));
+  q.setMeta.run('active_drops', JSON.stringify([...activeDrops.values()].map((d) => ({ channelId: d.msg.channelId, messageId: d.msg.id }))));
 
 async function expireStaleDrops() {
   const refs = JSON.parse(q.getMeta.get('active_drops')?.value ?? '[]');
@@ -3023,8 +3195,7 @@ async function expireStaleDrops() {
   q.setMeta.run('active_drops', '[]');
 }
 
-async function spawnDrop() {
-  const channel = await client.channels.fetch(DROP_CHANNEL_ID);
+async function spawnDrop(channel) {
   const golden = Math.random() < 0.15;
   const seq = Number(q.getMeta.get('drop_seq')?.value ?? 0) + 1;
   q.setMeta.run('drop_seq', String(seq));
@@ -3047,13 +3218,32 @@ async function spawnDrop() {
   saveDropRefs();
 }
 
+// The next drop time is saved, so restarts don't keep pushing it back.
+const scheduleDrop = (now) => {
+  const next = now + rand(DROP_MIN_MINUTES, DROP_MAX_MINUTES) * 60;
+  q.setMeta.run('drop_next', String(next));
+  return next;
+};
+
 async function dropTick() {
   if (!DROP_CHANNEL_ID) return;
   const now = nowSec();
-  if (!nextDropAt) nextDropAt = now + rand(DROP_MIN_MINUTES, DROP_MAX_MINUTES) * 60;
-  if (now < nextDropAt) return;
-  nextDropAt = now + rand(DROP_MIN_MINUTES, DROP_MAX_MINUTES) * 60;
-  await spawnDrop();
+  const next = Number(q.getMeta.get('drop_next')?.value ?? 0) || scheduleDrop(now);
+  if (now < next) return;
+  scheduleDrop(now);
+  const channel = await client.channels.fetch(DROP_CHANNEL_ID).catch((err) => {
+    console.error(`Orb drops: can't use channel ${DROP_CHANNEL_ID} (${err.message}). Check the ID and that the bot can view and post there.`);
+    return null;
+  });
+  if (channel) await spawnDrop(channel);
+}
+
+async function handleDrop(i) {
+  if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
+  const channel = DROP_CHANNEL_ID ? await client.channels.fetch(DROP_CHANNEL_ID).catch(() => null) : i.channel;
+  if (!channel) return fail(i, `I can't use the drop channel (\`DROP_CHANNEL_ID\`). Check the ID and that I can view and post there.`);
+  await spawnDrop(channel);
+  return i.reply({ content: `${ORB} Dropped an orb in <#${channel.id}>.`, flags: EPH });
 }
 
 async function handleDropButton(i) {
@@ -3215,8 +3405,12 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleUse(i);
       case 'stocks':
         return await handleStocks(i);
+      case 'gd':
+        return await handleGd(i);
       case 'stock':
         return await handleStock(i);
+      case 'drop':
+        return await handleDrop(i);
       case 'rob':
         return await handleRob(i);
       case 'bank':
@@ -3308,6 +3502,17 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   supplyStart();
   await expireStaleDrops().catch((err) => console.error('Drop cleanup failed:', err.message));
+  if (DROP_CHANNEL_ID) {
+    const ch = await client.channels.fetch(DROP_CHANNEL_ID).catch((err) => err);
+    const next = Number(q.getMeta.get('drop_next')?.value ?? 0);
+    console.log(
+      ch?.id
+        ? `Orb drops: on, in #${ch.name ?? ch.id}${next ? `, next around ${new Date(next * 1000).toISOString()}` : ', first one in 20-40 min'}`
+        : `Orb drops: DROP_CHANNEL_ID is set but I can't use that channel (${ch?.message ?? 'not found'})`
+    );
+  } else {
+    console.log('Orb drops: off (set DROP_CHANNEL_ID to turn them on)');
+  }
   try {
     // Clear the other scope so commands don't show up twice (global + guild).
     if (GUILD_ID) {
