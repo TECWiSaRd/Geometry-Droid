@@ -37,6 +37,20 @@ const SCALE_PAYOUTS = true; // earn payouts grow with the supply so the economy 
 const PRICE_SCALE = 0.04; // shop prices gain 4% per doubling of the supply cap (2T cap ≈ +48%)
 
 const PAY_TAX = 0.1; // share of each /pay removed from circulation (back into the vault)
+// Robbery only reaches the wallet; banked orbs are safe. Its costs go to the vault (not to anyone),
+// so robbing an alt can't move orbs more cheaply than /pay.
+const ROB_COOLDOWN = 60 * 60; // between attempts
+const ROB_SUCCESS = 0.4;
+const ROB_STEAL = [0.1, 0.25]; // share of the target's wallet taken on success
+const ROB_CUT = 0.2; // share of the loot lost while escaping (to the vault)
+const ROB_FINE = 0.15; // share of the robber's wallet lost when caught (to the vault)
+const ROB_JAIL = 24 * 60 * 60; // getting caught also bans the robber from the bot for this long
+const ROB_WINDOW = 60; // seconds anyone has to call the police before the robbery resolves
+const POLICE_REWARD = 0.05; // of the robber's orbs, paid by the robber to whoever stops them
+const ROB_MIN_TARGET = 1_000; // smallest wallet worth robbing; scales with payouts
+const ROB_MIN_ROBBER = 500; // robbers need this much to cover a fine; scales with payouts
+const ROB_SHIELD = 3 * 60 * 60; // after being robbed, safe for this long
+const BANK_PER_LEVEL = 10_000; // bank space per player level; scales with payouts
 const DAILY_BASE = 500;
 const DAILY_STEP = 100; // extra per streak day
 const DAILY_MAX_STREAK = 10; // streak bonus stops growing after this many days
@@ -188,6 +202,12 @@ const SHOP = {
     price: 800,
     consumable: { kind: 'reset', daily: 3 },
   },
+  padlock: {
+    name: '🛡️ Padlock',
+    desc: 'Use it to guard your wallet for 24 hours. The next robbery attempt fails and the robber is fined. Up to 2 per day.',
+    price: 1_500,
+    consumable: { kind: 'padlock', hours: 24, daily: 2 },
+  },
 };
 const MAX_STACK = 20; // most of one consumable a player can hold
 
@@ -297,6 +317,8 @@ const ACHIEVEMENTS = [
   { key: 'team_spirit', name: '🤝 Team Spirit', desc: 'Help complete 3 weekly challenges', stat: 'weekly_done', goal: 3, reward: 3_000 },
   { key: 'season_champ', name: '👑 Season Champion', desc: 'Finish a season in 1st place', stat: 'season_wins', goal: 1, reward: 10_000 },
   { key: 'level_clearer', name: '🎮 Level Clearer', desc: 'Get 5 Level of the Week clears verified', stat: 'lotw', goal: 5, reward: 10_000 },
+  { key: 'hero', name: '🚔 Hero', desc: 'Stop 3 robberies by calling the police', stat: 'police_calls', goal: 3, reward: 2_000 },
+  { key: 'master_thief', name: '🦹 Master Thief', desc: 'Pull off 10 successful robberies', stat: 'robs', goal: 10, reward: 2_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
 ];
@@ -431,13 +453,21 @@ CREATE TABLE IF NOT EXISTS holdings (
 );
 `);
 
+// Databases from before the bank existed need the column added.
+if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'bank')) {
+  db.exec('ALTER TABLE users ADD COLUMN bank INTEGER NOT NULL DEFAULT 0 CHECK (bank >= 0)');
+}
+
 const q = {
   ensure: db.prepare('INSERT OR IGNORE INTO users (id) VALUES (?)'),
   bal: db.prepare('SELECT balance FROM users WHERE id = ?'),
   add: db.prepare('UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE id = ?'),
   sub: db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?'),
   refund: db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?'),
-  top: db.prepare('SELECT id, balance FROM users WHERE balance > 0 ORDER BY balance DESC LIMIT 10'),
+  top: db.prepare('SELECT id, balance + bank AS total FROM users WHERE balance + bank > 0 ORDER BY total DESC LIMIT 10'),
+  getBank: db.prepare('SELECT bank FROM users WHERE id = ?'),
+  toBank: db.prepare('UPDATE users SET balance = balance - @n, bank = bank + @n WHERE id = @id AND balance >= @n'),
+  fromBank: db.prepare('UPDATE users SET balance = balance + @n, bank = bank - @n WHERE id = @id AND bank >= @n'),
   getCd: db.prepare('SELECT ts FROM cooldowns WHERE user_id = ? AND action = ?'),
   setCd: db.prepare('INSERT OR REPLACE INTO cooldowns (user_id, action, ts) VALUES (?, ?, ?)'),
   hasItem: db.prepare('SELECT 1 FROM purchases WHERE user_id = ? AND item = ?'),
@@ -448,7 +478,7 @@ const q = {
   salaries: db.prepare('SELECT role_id, amount FROM salaries WHERE guild_id = ? ORDER BY amount DESC'),
   getStrike: db.prepare('SELECT fails, locked_until, streak FROM strikes WHERE user_id = ?'),
   upsertStrike: db.prepare('INSERT OR REPLACE INTO strikes (user_id, fails, locked_until, streak) VALUES (?, ?, ?, ?)'),
-  circ: db.prepare('SELECT COALESCE(SUM(balance), 0) AS s FROM users'),
+  circ: db.prepare('SELECT COALESCE(SUM(balance + bank), 0) AS s FROM users'),
   getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
   setMeta: db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'),
   getTool: db.prepare('SELECT level FROM tools WHERE user_id = ? AND tool = ?'),
@@ -668,6 +698,49 @@ const delistTx = db.transaction((sym, price) => {
   return paid;
 });
 
+// A successful robbery: the robber keeps the loot minus the escape cut, which goes to the vault.
+const robTx = db.transaction((robber, target, pct) => {
+  const stolen = Math.floor(getBalance(target) * pct);
+  if (stolen <= 0) return null;
+  const lost = Math.ceil(stolen * ROB_CUT);
+  q.sub.run(stolen, target);
+  q.ensure.run(robber);
+  q.refund.run(stolen - lost, robber);
+  return { stolen, kept: stolen - lost, lost };
+});
+
+// Takes orbs from the wallet first, then the bank, so banking mid-robbery can't dodge a fine.
+function charge(uid, amount) {
+  const fromWallet = Math.min(amount, getBalance(uid));
+  if (fromWallet > 0) q.sub.run(fromWallet, uid);
+  const fromBank = amount - fromWallet;
+  if (fromBank > 0) {
+    q.fromBank.run({ n: fromBank, id: uid }); // bank -> wallet, then out
+    q.sub.run(fromBank, uid);
+  }
+}
+const holdings = (uid) => getBalance(uid) + (q.getBank.get(uid)?.bank ?? 0);
+
+// A caught robber loses ROB_FINE of everything they hold, to the vault.
+const fineTx = db.transaction((uid) => {
+  const fine = Math.ceil(holdings(uid) * ROB_FINE);
+  if (fine > 0) charge(uid, fine);
+  return fine;
+});
+
+// Stopped by the police: the usual fine to the vault, plus POLICE_REWARD paid to the caller.
+const policeTx = db.transaction((robber, caller) => {
+  const total = holdings(robber);
+  const fine = Math.ceil(total * ROB_FINE);
+  const reward = Math.floor(total * POLICE_REWARD);
+  charge(robber, fine + reward);
+  if (reward > 0) {
+    q.ensure.run(caller);
+    q.refund.run(reward, caller);
+  }
+  return { fine, reward };
+});
+
 // Takes one from the inventory if the player has one and hasn't hit today's limit.
 const useItemTx = db.transaction((uid, key, day, daily) => {
   if ((q.getQty.get(uid, key)?.qty ?? 0) < 1) return 'none';
@@ -852,6 +925,7 @@ const commands = [
           { name: 'Clans', value: 'social' },
           { name: 'Events', value: 'events' },
           { name: 'Stocks', value: 'stocks' },
+          { name: 'Robbery', value: 'robbery' },
           { name: 'Admin', value: 'admin' }
         )
     ),
@@ -935,6 +1009,20 @@ const commands = [
         .setName('remove')
         .setDescription('Delist a stock and pay holders the last price (Manage Server)')
         .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
+    ),
+  new SlashCommandBuilder()
+    .setName('rob')
+    .setDescription(`Steal from someone's wallet (${ROB_SUCCESS * 100}% chance; caught = fine + ${ROB_JAIL / 3600}h ban)`)
+    .addUserOption((o) => o.setName('user').setDescription('Who to rob').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('bank')
+    .setDescription('Keep orbs safe from robbers')
+    .addSubcommand((s) => s.setName('view').setDescription('Your wallet, bank and bank space'))
+    .addSubcommand((s) =>
+      s.setName('deposit').setDescription('Move orbs into the bank (default: as much as fits)').addIntegerOption((o) => o.setName('amount').setDescription('How many').setMinValue(1))
+    )
+    .addSubcommand((s) =>
+      s.setName('withdraw').setDescription('Move orbs back to your wallet (default: all)').addIntegerOption((o) => o.setName('amount').setDescription('How many').setMinValue(1))
     ),
   new SlashCommandBuilder()
     .setName('portfolio')
@@ -1363,6 +1451,10 @@ async function handleUse(i) {
     const until = q.getBuff.get(uid, 'speed')?.until ?? 0;
     if (until > now) return fail(i, `A Speed Potion is already active until <t:${until}:t>.`);
   }
+  if (c.kind === 'padlock') {
+    const until = q.getBuff.get(uid, 'padlock')?.until ?? 0;
+    if (until > now) return fail(i, `A Padlock is already guarding your wallet until <t:${until}:t>.`);
+  }
   if (c.kind === 'reset') {
     const waiting = Object.entries(ACTIONS).some(([name, a]) => now < (q.getCd.get(uid, name)?.ts ?? 0) + Math.ceil(a.cooldown * cooldownMult(uid, now)));
     if (!waiting) return fail(i, 'None of your earn commands are on cooldown, so the Hourglass would be wasted.');
@@ -1378,6 +1470,11 @@ async function handleUse(i) {
     const until = now + c.minutes * 60;
     q.setBuff.run(uid, 'speed', until);
     return i.reply({ embeds: [embed(`All your earn cooldowns are halved until <t:${until}:t> (<t:${until}:R>).${footer}`, `${item.name} active`)] });
+  }
+  if (c.kind === 'padlock') {
+    const until = now + c.hours * 3600;
+    q.setBuff.run(uid, 'padlock', until);
+    return i.reply({ embeds: [embed(`Your wallet is guarded until <t:${until}:f>. The next robbery attempt will fail and the robber gets fined.${footer}`, `${item.name} active`)] });
   }
   // Backdate each cooldown just far enough that it's ready now; the timestamps stay recent for activity counts.
   for (const [name, a] of Object.entries(ACTIONS)) {
@@ -1395,7 +1492,16 @@ async function handleInventory(i) {
     .map(([key, s]) => `**${s.name}** × ${owned.get(key) ?? 0} · ${usesLeft(uid, key)}/${s.consumable.daily} uses left today`)
     .join('\n');
   const until = q.getBuff.get(uid, 'speed')?.until ?? 0;
-  const effects = until > now ? `🧪 Speed Potion: cooldowns halved until <t:${until}:t> (<t:${until}:R>)` : 'None';
+  const lock = q.getBuff.get(uid, 'padlock')?.until ?? 0;
+  const shield = q.getBuff.get(uid, 'rob_shield')?.until ?? 0;
+  const effects =
+    [
+      until > now && `🧪 Speed Potion: cooldowns halved until <t:${until}:t> (<t:${until}:R>)`,
+      lock > now && `🛡️ Padlock: wallet guarded until <t:${lock}:t> (<t:${lock}:R>)`,
+      shield > now && `🕶️ Lying low after a robbery: safe until <t:${shield}:t> (<t:${shield}:R>)`,
+    ]
+      .filter(Boolean)
+      .join('\n') || 'None';
   const tools = Object.entries(SHOP)
     .filter(([key, s]) => s.perk && toolLevel(uid, key))
     .map(([key, s]) => `**${s.name}** level ${toolLevel(uid, key)} (${toolRange(key, toolLevel(uid, key))} on /${s.perk.action})`)
@@ -2211,6 +2317,176 @@ async function handleLotwButton(i) {
   return tellPlayer(row.user_id, withNotes(`Your Level of the Week clear was verified! You earned **${fmt(granted)}** ${ORB}.`, notes), '🎮 Clear verified');
 }
 
+/* ───────────── Robbery and the bank ───────────── */
+
+const bankSpace = (uid) => Math.floor(BANK_PER_LEVEL * levelOf(progressOf(uid).xp) * payoutMultiplier());
+
+const robberies = new Map(); // id -> robbery waiting out its police window (in memory)
+
+const jailRobber = (uid, now) => {
+  const until = now + ROB_JAIL;
+  q.setBuff.run(uid, 'jail', until);
+  return `🚔 <@${uid}> is banned from the bot until <t:${until}:f> (<t:${until}:R>).`;
+};
+const warnTarget = (r, text, components = []) =>
+  r.targetUser.send({ embeds: [embed(text, '🦹 Robbery')], components }).catch(() => {});
+const policeRow = (id) =>
+  new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`pol:${id}`).setLabel('Call the police').setEmoji('🚨').setStyle(ButtonStyle.Danger));
+
+async function handleRob(i) {
+  const target = i.options.getUser('user');
+  const uid = i.user.id;
+  const now = nowSec();
+  if (target.bot || target.id === uid) return fail(i, 'Pick another real player.');
+
+  const last = q.getCd.get(uid, 'rob')?.ts ?? 0;
+  if (now < last + ROB_COOLDOWN) return fail(i, `You can try another robbery <t:${last + ROB_COOLDOWN}:R>.`);
+  if ([...robberies.values()].some((r) => r.target === target.id)) return fail(i, `Someone is already robbing ${target}.`);
+  const shield = q.getBuff.get(target.id, 'rob_shield')?.until ?? 0;
+  if (shield > now) return fail(i, `${target} was robbed recently and is lying low until <t:${shield}:R>.`);
+  const minTarget = Math.floor(ROB_MIN_TARGET * payoutMultiplier());
+  if (getBalance(target.id) < minTarget) return fail(i, `${target} has less than **${fmt(minTarget)}** ${ORB} in their wallet. Not worth the risk.`);
+  const minRobber = Math.floor(ROB_MIN_ROBBER * payoutMultiplier());
+  if (holdings(uid) < minRobber) return fail(i, `You need at least **${fmt(minRobber)}** ${ORB} to cover the fine if you get caught.`);
+  q.setCd.run(uid, 'rob', now);
+
+  const r = { id: Math.random().toString(36).slice(2, 10), robber: uid, target: target.id, targetUser: target, origin: i, tried: new Set(), checks: new Map() };
+
+  if ((q.getBuff.get(target.id, 'padlock')?.until ?? 0) > now) {
+    q.setBuff.run(target.id, 'padlock', 0); // used up
+    const fine = fineTx(uid);
+    warnTarget(r, `${i.user} tried to rob you, but your 🛡️ Padlock stopped them. It's used up now.`);
+    return i.reply({
+      embeds: [embed(`${i.user} tried to rob ${target}, but a 🛡️ Padlock was guarding their wallet. They were caught and fined **${fmt(fine)}** ${ORB}.\n${jailRobber(uid, now)}`, '🔒 Robbery foiled')],
+    });
+  }
+
+  robberies.set(r.id, r);
+  r.timer = setTimeout(() => finishRobbery(r).catch(console.error), ROB_WINDOW * 1000);
+  warnTarget(r, `${i.user} is robbing you right now! Call the police within **${ROB_WINDOW}s**, or move your orbs into \`/bank\`.`, [policeRow(r.id)]);
+  return i.reply({
+    embeds: [
+      embed(
+        `${i.user} is robbing ${target}! Anyone can stop it in the next **${ROB_WINDOW}s**: click **Call the police** and pass a quick check to earn **${POLICE_REWARD * 100}%** of the robber's orbs.`,
+        '🦹 Robbery in progress'
+      ),
+    ],
+    components: [policeRow(r.id)],
+  });
+}
+
+// Nobody called the police in time: the robbery succeeds or fails on its own.
+async function finishRobbery(r) {
+  if (!robberies.delete(r.id)) return; // already stopped
+  const now = nowSec();
+  let text;
+  let title;
+  if (Math.random() >= ROB_SUCCESS) {
+    const fine = fineTx(r.robber);
+    text = `<@${r.robber}> tried to rob <@${r.target}> and got caught! Fined **${fmt(fine)}** ${ORB}.\n${jailRobber(r.robber, now)}`;
+    title = '🚨 Caught';
+    warnTarget(r, `<@${r.robber}> tried to rob you but got caught.`);
+  } else {
+    const loot = robTx(r.robber, r.target, ROB_STEAL[0] + Math.random() * (ROB_STEAL[1] - ROB_STEAL[0]));
+    if (!loot) {
+      text = `<@${r.target}>'s wallet was empty by the time <@${r.robber}> got there.`;
+    } else {
+      q.setBuff.run(r.target, 'rob_shield', now + ROB_SHIELD);
+      const notes = [];
+      bumpStat(r.robber, 'robs', 1, notes);
+      warnTarget(r, `<@${r.robber}> robbed **${fmt(loot.stolen)}** ${ORB} from your wallet! Keep orbs in \`/bank\` or use a 🛡️ Padlock to stay safe.`);
+      text =
+        withNotes(`<@${r.robber}> robbed <@${r.target}> and got away with **${fmt(loot.kept)}** ${ORB} (**${fmt(loot.lost)}** dropped while escaping).`, notes) +
+        `\n\n<@${r.target}> is lying low for ${ROB_SHIELD / 3600}h.`;
+    }
+    title = '🦹 Robbery';
+  }
+  await r.origin.editReply({ embeds: [embed(text, title)], components: [] }).catch(() => {});
+}
+
+// "Call the police" opens a private bot check; the first right answer stops the robbery.
+async function handlePoliceButton(i) {
+  const [, id, choice] = i.customId.split(':');
+  const r = robberies.get(id);
+  const uid = i.user.id;
+  if (!r) return choice === undefined ? i.reply({ content: '❌ Too late, this robbery is already over.', flags: EPH }) : i.update({ content: '❌ Too late, this robbery is already over.', embeds: [], components: [] });
+  if (uid === r.robber) return i.reply({ content: "❌ You can't call the police on yourself.", flags: EPH });
+
+  if (choice === undefined) {
+    if (r.tried.has(uid)) return i.reply({ content: '❌ You already called the police on this robbery.', flags: EPH });
+    r.tried.add(uid);
+    const ch = makeChallenge(['math', 'symbol']);
+    r.checks.set(uid, { answer: ch.answer, expires: Date.now() + CHALLENGE_SECONDS * 1000 });
+    const row = new ActionRowBuilder().addComponents(
+      ch.options.map((label, n) => new ButtonBuilder().setCustomId(`pol:${id}:${n}`).setLabel(label).setStyle(ButtonStyle.Secondary))
+    );
+    return i.reply({ embeds: [embed(`${ch.prompt}\n\nAnswer within **${CHALLENGE_SECONDS}s** to stop the robbery.`, '🚨 Calling the police')], components: [row], flags: EPH });
+  }
+
+  const check = r.checks.get(uid);
+  if (!check) return i.reply({ content: '❌ Click **Call the police** first.', flags: EPH });
+  r.checks.delete(uid);
+  if (Date.now() > check.expires) return i.update({ content: '⏰ Too slow. The police hung up.', embeds: [], components: [] });
+  if (Number(choice) !== check.answer) return i.update({ content: "❌ Wrong answer. The police didn't believe you.", embeds: [], components: [] });
+
+  // Stopped. Claim the robbery first so the timer (or another caller) can't also settle it.
+  if (!robberies.delete(id)) return i.update({ content: '❌ Too late, this robbery is already over.', embeds: [], components: [] });
+  clearTimeout(r.timer);
+  const now = nowSec();
+  const { fine, reward } = policeTx(r.robber, uid);
+  const notes = [];
+  bumpStat(uid, 'police_calls', 1, notes);
+  await i.update({ content: withNotes(`🚔 You stopped the robbery and earned **${fmt(reward)}** ${ORB}!`, notes), embeds: [], components: [] });
+  warnTarget(r, `${i.user} called the police and stopped <@${r.robber}> from robbing you.`);
+  await r.origin
+    .editReply({
+      embeds: [
+        embed(
+          `${i.user} called the police on <@${r.robber}>! The robber was fined **${fmt(fine)}** ${ORB} and paid **${fmt(reward)}** ${ORB} to ${i.user}.\n${jailRobber(r.robber, now)}`,
+          '🚔 Robbery stopped'
+        ),
+      ],
+      components: [],
+    })
+    .catch(() => {});
+}
+
+async function handleBank(i) {
+  const sub = i.options.getSubcommand();
+  const uid = i.user.id;
+  q.ensure.run(uid);
+  const space = bankSpace(uid);
+  const banked = q.getBank.get(uid).bank;
+  const wallet = getBalance(uid);
+  const summary = () => {
+    const b = q.getBank.get(uid).bank;
+    return `Wallet: **${fmt(getBalance(uid))}** ${ORB}\nBank: **${fmt(b)}** / ${fmt(space)} ${ORB}`;
+  };
+
+  if (sub === 'deposit') {
+    const room = Math.max(0, space - banked);
+    const asked = Math.min(i.options.getInteger('amount') ?? wallet, wallet);
+    if (asked <= 0) return fail(i, 'Your wallet is empty.');
+    if (room <= 0) return fail(i, `Your bank is full (${fmt(banked)} / ${fmt(space)}). It grows as you level up.`);
+    const n = Math.min(asked, room);
+    q.toBank.run({ n, id: uid });
+    const capped = n < asked ? `\nOnly **${fmt(n)}** fit. Your bank grows as you level up.` : '';
+    return i.reply({ embeds: [embed(`Deposited **${fmt(n)}** ${ORB}. Banked orbs can't be stolen.${capped}\n\n${summary()}`, '🏦 Bank')], flags: EPH });
+  }
+
+  if (sub === 'withdraw') {
+    const n = Math.min(i.options.getInteger('amount') ?? banked, banked);
+    if (n <= 0) return fail(i, 'Your bank is empty.');
+    q.fromBank.run({ n, id: uid });
+    return i.reply({ embeds: [embed(`Withdrew **${fmt(n)}** ${ORB}. Orbs in your wallet can be robbed.\n\n${summary()}`, '🏦 Bank')], flags: EPH });
+  }
+
+  return i.reply({
+    embeds: [embed(`${summary()}\n\nBanked orbs can't be stolen. Your bank holds **${fmt(BANK_PER_LEVEL)}** per level (scaled with payouts), so it grows as you level up. Spending and \`/pay\` use your wallet.`, '🏦 Bank')],
+    flags: EPH,
+  });
+}
+
 /* ───────────── Stocks ───────────── */
 
 // Seed the starting stocks once; after that moderators manage the list.
@@ -2560,6 +2836,7 @@ const HELP_TOPICS = {
   social: '🏰 Clans',
   events: '🎉 Events',
   stocks: '📈 Stocks',
+  robbery: '🦹 Robbery',
   admin: '🛠️ Admin',
 };
 
@@ -2624,6 +2901,20 @@ function helpText(topic) {
       `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it and you get paid by star rating.`
     );
   }
+  if (topic === 'robbery') {
+    return (
+      `\`/rob @user\` tries to steal **${ROB_STEAL[0] * 100}-${ROB_STEAL[1] * 100}%** of their wallet. It works **${ROB_SUCCESS * 100}%** of the time, once an hour. ` +
+      `${ROB_CUT * 100}% of the loot is dropped while escaping. Get caught and you're fined **${ROB_FINE * 100}%** of your orbs **and banned from the bot for ${ROB_JAIL / 3600}h**.\n\n` +
+      `**Call the police:** every robbery takes ${ROB_WINDOW}s. Anyone can click 🚨 **Call the police** and pass a quick check to stop it. ` +
+      `The robber gets caught, and pays the caller ${POLICE_REWARD * 100}% of their orbs on top of the fine.\n\n` +
+      `**Staying safe**\n` +
+      `🏦 \`/bank deposit\`: banked orbs can't be stolen. Your bank holds more as you level up.\n` +
+      `🛡️ **Padlock** (\`/shop\`): guards your wallet for 24h. The next robber fails and gets fined.\n` +
+      `🏦 During a robbery you get a DM, so you can call the police yourself or bank your orbs in time.\n` +
+      `🕶️ After you're robbed, nobody can rob you for ${ROB_SHIELD / 3600}h.\n\n` +
+      `Wallets under ${scaled(ROB_MIN_TARGET)} ${ORB} aren't worth robbing, and you need ${scaled(ROB_MIN_ROBBER)} ${ORB} yourself to cover a fine.`
+    );
+  }
   if (topic === 'stocks') {
     const list = q.listedStocks.all();
     const levels = list.filter((x) => x.kind === 'level').map((x) => `**${x.sym}** ${x.name}`).join(', ') || 'none yet';
@@ -2661,7 +2952,7 @@ const helpRows = (active) => {
   const buttons = Object.entries(HELP_TOPICS).map(([key, label]) =>
     new ButtonBuilder().setCustomId(`help:${key}`).setLabel(label).setStyle(key === active ? ButtonStyle.Primary : ButtonStyle.Secondary)
   );
-  return [new ActionRowBuilder().addComponents(buttons.slice(0, 4)), new ActionRowBuilder().addComponents(buttons.slice(4))];
+  return [new ActionRowBuilder().addComponents(buttons.slice(0, 5)), new ActionRowBuilder().addComponents(buttons.slice(5))];
 };
 
 const helpPage = (topic) => ({
@@ -2823,9 +3114,17 @@ async function checkDiscordReachable() {
 }
 
 client.on(Events.InteractionCreate, async (i) => {
+  if (!i.isAutocomplete()) {
+    const jailed = q.getBuff.get(i.user.id, 'jail')?.until ?? 0;
+    if (jailed > nowSec()) {
+      return i
+        .reply({ content: `🚔 You got caught robbing someone and are banned from the bot until <t:${jailed}:f> (<t:${jailed}:R>).`, flags: EPH })
+        .catch(() => {});
+    }
+  }
   if (i.isButton()) {
     const handler =
-      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton }[i.customId.split(':')[0]] ??
+      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton, pol: handlePoliceButton }[i.customId.split(':')[0]] ??
       handleChallengeButton;
     return handler(i).catch(async (err) => {
       console.error(err);
@@ -2844,7 +3143,8 @@ client.on(Events.InteractionCreate, async (i) => {
     switch (cmd) {
       case 'balance': {
         const user = i.options.getUser('user') ?? i.user;
-        return i.reply({ embeds: [embed(`${user} has **${fmt(getBalance(user.id))}** ${ORB}`, 'Mana Orbs')] });
+        const bank = q.getBank.get(user.id)?.bank ?? 0;
+        return i.reply({ embeds: [embed(`${user} has **${fmt(getBalance(user.id))}** ${ORB} in their wallet and **${fmt(bank)}** ${ORB} in the bank.`, 'Mana Orbs')] });
       }
       case 'pay': {
         const target = i.options.getUser('user');
@@ -2880,6 +3180,10 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleStocks(i);
       case 'stock':
         return await handleStock(i);
+      case 'rob':
+        return await handleRob(i);
+      case 'bank':
+        return await handleBank(i);
       case 'portfolio':
         return await handlePortfolio(i);
       case 'inventory':
@@ -2890,7 +3194,7 @@ client.on(Events.InteractionCreate, async (i) => {
         const rows = q.top.all();
         const medals = ['🥇', '🥈', '🥉'];
         const text = rows.length
-          ? rows.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.id}> — ${fmt(r.balance)} ${ORB}`).join('\n')
+          ? rows.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.id}> — ${fmt(r.total)} ${ORB}`).join('\n')
           : 'Nobody has any orbs yet. Try `/work`!';
         return i.reply({ embeds: [embed(text, '🏆 Richest players')] });
       }
