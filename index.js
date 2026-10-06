@@ -167,6 +167,18 @@ const STOCK_WARMUP_HOURS = 36; // new listings collect data this long before tra
 // /stock propose needs a verified GD account (/gd link) with either of these. Harder demons count too.
 const PROPOSE_MIN_MEDIUM = 5; // Medium Demons or harder
 const PROPOSE_MIN_HARD = 2; // ...or Hard Demons or harder
+// Linked GD accounts are re-checked in the background; new demons and creator points pay out (base amounts).
+const GD_SYNC_HOURS = 6;
+const GD_SYNC_BATCH = 5; // accounts checked per 5-minute tick
+const GD_MANUAL_SYNC_MINUTES = 10; // /gd sync cooldown
+const GD_DEMON_REWARDS = { easy: 1_000, medium: 2_500, hard: 5_000, insane: 10_000, extreme: 25_000 }; // per new demon
+const GD_CP_REWARD = 5_000; // per new creator point
+const GUESS_COOLDOWN = 5 * 60;
+const GUESS_SECONDS = 30;
+const GUESS_REWARD = [300, 700]; // base, scales with payouts
+const PREDICT_TOP = 25; // demons you can bet on
+const PREDICT_FEE = 0.05; // of each pool, to the vault
+const PREDICT_OPEN_DAYS = 2; // betting closes this many days into the week (weeks start Monday UTC)
 const MAX_REVIEW_DMS = 25; // review requests go to at most this many moderators by DM
 const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID || LOTW_REVIEW_CHANNEL_ID; // where stock proposals go; also clears if LOTW_REVIEW_CHANNEL_ID isn't set
 const STOCK_BASE = 1_000; // price at a stock's usual level. Fixed, so holding doesn't ride payout growth for free
@@ -408,6 +420,13 @@ const ACHIEVEMENTS = [
   { key: 'season_champ', name: '👑 Season Champion', desc: 'Finish a season in 1st place', stat: 'season_wins', goal: 1, reward: 10_000 },
   { key: 'level_clearer', name: '🎮 Level Clearer', desc: 'Get 5 Level of the Week clears verified', stat: 'lotw', goal: 5, reward: 10_000 },
   { key: 'hero', name: '🚔 Hero', desc: 'Stop 3 robberies by calling the police', stat: 'police_calls', goal: 3, reward: 2_000 },
+  { key: 'level_expert', name: '🔎 Level Expert', desc: 'Guess 25 levels right with /guess', stat: 'guess', goal: 25, reward: 3_000 },
+  { key: 'oracle', name: '🔮 Oracle', desc: 'Win 5 Demonlist predictions', stat: 'predict_wins', goal: 5, reward: 3_000 },
+  { key: 'gd_extreme', name: '💀 Extreme Victor', desc: 'Beat an Extreme Demon in Geometry Dash (linked account)', stat: 'gd_extreme', goal: 1, reward: 10_000 },
+  { key: 'gd_centurion', name: '😈 Centurion', desc: 'Beat 100 demons in Geometry Dash (linked account)', stat: 'gd_demons', goal: 100, reward: 10_000 },
+  { key: 'gd_stars', name: '⭐ Star Collector', desc: 'Reach 10,000 stars in Geometry Dash (linked account)', stat: 'gd_stars', goal: 10_000, reward: 5_000 },
+  { key: 'gd_moons', name: '🌙 Moonwalker', desc: 'Reach 1,000 moons in Geometry Dash (linked account)', stat: 'gd_moons', goal: 1_000, reward: 3_000 },
+  { key: 'gd_creator', name: '🛠️ Rated Creator', desc: 'Earn a creator point in Geometry Dash (linked account)', stat: 'gd_cp', goal: 1, reward: 5_000 },
   { key: 'master_thief', name: '🦹 Master Thief', desc: 'Pull off 10 successful robberies', stat: 'robs', goal: 10, reward: 2_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
@@ -529,6 +548,20 @@ CREATE TABLE IF NOT EXISTS item_uses (
 CREATE TABLE IF NOT EXISTS review_msgs (
   kind TEXT NOT NULL, ref TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
   PRIMARY KEY (kind, ref, message_id)
+);
+CREATE TABLE IF NOT EXISTS gd_stats (
+  user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+  stars INTEGER NOT NULL, moons INTEGER NOT NULL, demons INTEGER NOT NULL, cp INTEGER NOT NULL,
+  easy INTEGER NOT NULL, medium INTEGER NOT NULL, hard INTEGER NOT NULL, insane INTEGER NOT NULL, extreme INTEGER NOT NULL,
+  synced_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS predict_markets (
+  week INTEGER NOT NULL, demon_id INTEGER NOT NULL, name TEXT NOT NULL, start_pos INTEGER NOT NULL,
+  PRIMARY KEY (week, demon_id)
+);
+CREATE TABLE IF NOT EXISTS predict_bets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, week INTEGER NOT NULL, demon_id INTEGER NOT NULL,
+  user_id TEXT NOT NULL, side TEXT NOT NULL, amount INTEGER NOT NULL, ts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS gd_links (
   user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, username TEXT NOT NULL,
@@ -666,6 +699,18 @@ const q = {
   verifyLink: db.prepare('UPDATE gd_links SET verified = 1 WHERE user_id = ?'),
   linkedElsewhere: db.prepare('SELECT user_id FROM gd_links WHERE account_id = ? AND verified = 1 AND user_id != ?'),
   delLink: db.prepare('DELETE FROM gd_links WHERE user_id = ?'),
+  getGdStats: db.prepare('SELECT * FROM gd_stats WHERE user_id = ?'),
+  setGdStats: db.prepare(`INSERT OR REPLACE INTO gd_stats (user_id, account_id, stars, moons, demons, cp, easy, medium, hard, insane, extreme, synced_at)
+    VALUES (@uid, @account, @stars, @moons, @demons, @cp, @easy, @medium, @hard, @insane, @extreme, @ts)`),
+  gdDue: db.prepare(`SELECT l.user_id FROM gd_links l LEFT JOIN gd_stats s ON s.user_id = l.user_id
+    WHERE l.verified = 1 AND COALESCE(s.synced_at, 0) < ? ORDER BY COALESCE(s.synced_at, 0) LIMIT ?`),
+  newMarket: db.prepare('INSERT OR IGNORE INTO predict_markets (week, demon_id, name, start_pos) VALUES (?, ?, ?, ?)'),
+  getMarket: db.prepare('SELECT * FROM predict_markets WHERE week = ? AND demon_id = ?'),
+  marketsOf: db.prepare('SELECT * FROM predict_markets WHERE week = ? ORDER BY start_pos'),
+  addBet: db.prepare('INSERT INTO predict_bets (week, demon_id, user_id, side, amount, ts) VALUES (?, ?, ?, ?, ?, ?)'),
+  betsOn: db.prepare('SELECT user_id, side, amount FROM predict_bets WHERE week = ? AND demon_id = ?'),
+  poolOf: db.prepare('SELECT COALESCE(SUM(amount), 0) AS n FROM predict_bets WHERE week = ? AND demon_id = ? AND side = ?'),
+  betsBy: db.prepare('SELECT b.side, b.amount, m.name FROM predict_bets b JOIN predict_markets m ON m.week = b.week AND m.demon_id = b.demon_id WHERE b.week = ? AND b.user_id = ?'),
   insertStock: db.prepare('INSERT INTO stocks (sym, name, kind, ref_id, status, proposer, listed_at, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
   stockBySym: db.prepare('SELECT * FROM stocks WHERE sym = ?'),
   stockByRef: db.prepare('SELECT * FROM stocks WHERE kind = ? AND ref_id = ?'),
@@ -1035,6 +1080,7 @@ const commands = [
           { name: 'Events', value: 'events' },
           { name: 'Stocks', value: 'stocks' },
           { name: 'Robbery', value: 'robbery' },
+          { name: 'Geometry Dash', value: 'gd' },
           { name: 'Admin', value: 'admin' }
         )
     ),
@@ -1083,7 +1129,48 @@ const commands = [
     .addSubcommand((s) => s.setName('link').setDescription('Start linking your GD account').addStringOption((o) => o.setName('username').setDescription('Your GD username').setRequired(true)))
     .addSubcommand((s) => s.setName('verify').setDescription('Finish linking after posting your code on your GD profile'))
     .addSubcommand((s) => s.setName('profile').setDescription('See a linked GD account').addUserOption((o) => o.setName('user').setDescription('Someone else')))
-    .addSubcommand((s) => s.setName('unlink').setDescription('Remove your GD account link')),
+    .addSubcommand((s) => s.setName('unlink').setDescription('Remove your GD account link'))
+    .addSubcommand((s) => s.setName('sync').setDescription('Check your GD account for new demons now (they pay out)'))
+    .addSubcommand((s) =>
+      s
+        .setName('top')
+        .setDescription('Server leaderboard of linked GD accounts')
+        .addStringOption((o) =>
+          o
+            .setName('stat')
+            .setDescription('What to rank by (default: stars)')
+            .addChoices(
+              { name: 'Stars', value: 'stars' },
+              { name: 'Demons', value: 'demons' },
+              { name: 'Moons', value: 'moons' },
+              { name: 'Extreme Demons', value: 'extreme' },
+              { name: 'Creator points', value: 'cp' }
+            )
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName('levelinfo')
+    .setDescription('Look up any Geometry Dash level')
+    .addStringOption((o) => o.setName('level').setDescription('Level name or ID').setRequired(true)),
+  new SlashCommandBuilder().setName('guess').setDescription('Guess a real Geometry Dash level from clues'),
+  new SlashCommandBuilder()
+    .setName('predict')
+    .setDescription('Bet on Demonlist moves this week')
+    .addSubcommand((s) =>
+      s
+        .setName('bet')
+        .setDescription('Bet that a top-25 demon moves up, down or stays by the end of the week')
+        .addStringOption((o) => o.setName('demon').setDescription('Which demon').setRequired(true).setAutocomplete(true))
+        .addStringOption((o) =>
+          o
+            .setName('side')
+            .setDescription('What will happen')
+            .setRequired(true)
+            .addChoices({ name: 'Moves up', value: 'up' }, { name: 'Moves down', value: 'down' }, { name: 'Stays put', value: 'same' })
+        )
+        .addIntegerOption((o) => o.setName('amount').setDescription('Orbs to bet').setRequired(true).setMinValue(1))
+    )
+    .addSubcommand((s) => s.setName('info').setDescription("This week's bets and pools")),
   new SlashCommandBuilder()
     .setName('stock')
     .setDescription('Trade stocks or look one up')
@@ -2743,11 +2830,15 @@ async function handleGd(i) {
     }
     if (q.linkedElsewhere.get(link.account_id, uid)) return fail(i, `**${link.username}** was just linked to another member.`);
     q.verifyLink.run(uid);
+    await syncGdAccount(uid).catch(() => {}); // starting point: only progress from now on pays
     const p = await gdProfile(link.username);
     const d = p ? demonCounts(p) : null;
     const status = d ? `\n\nDemons: ${demonLine(d)}\n${canPropose(d) ? '✅ You can propose stocks.' : `You can propose stocks once you have ${requirementText}.`}` : '';
     return i.editReply({ embeds: [embed(`You're verified as **${link.username}**. You can delete the profile post now.${status}`, '🔗 GD account linked')] });
   }
+
+  if (sub === 'sync') return handleGdSync(i);
+  if (sub === 'top') return handleGdTop(i);
 
   if (sub === 'unlink') {
     if (!q.getLink.get(uid)) return fail(i, "You haven't linked a GD account.");
@@ -3088,6 +3179,368 @@ async function handlePortfolio(i) {
   });
 }
 
+/* ───────────── GD progress, levels and the Demonlist ───────────── */
+
+const firstGuildId = () => GUILD_ID ?? client.guilds.cache.first()?.id ?? null;
+const capitalize = (w) => w[0].toUpperCase() + w.slice(1);
+
+// Checks a linked account for new demons and creator points since the last check, pays for them,
+// and unlocks GD milestone badges. The first check after linking only records a starting point,
+// so progress from before linking isn't paid.
+async function syncGdAccount(uid, { notify = false } = {}) {
+  const link = q.getLink.get(uid);
+  if (!link?.verified) return { error: "isn't linked" };
+  const p = await gdProfile(link.username);
+  if (!p) return { error: "couldn't reach the GD servers" };
+  if (String(p.accountID) !== link.account_id) return { error: 'changed its name, so it needs linking again with `/gd link`' };
+  const snap = { stars: p.stars ?? 0, moons: p.moons ?? 0, demons: p.demons ?? 0, cp: p.cp ?? 0, ...demonCounts(p) };
+  const prev = q.getGdStats.get(uid);
+  const fresh = !prev || prev.account_id !== link.account_id;
+  let base = 0;
+  const gains = [];
+  if (!fresh) {
+    for (const [kind, reward] of Object.entries(GD_DEMON_REWARDS)) {
+      const n = snap[kind] - prev[kind];
+      if (n > 0) {
+        base += n * reward;
+        gains.push(`${n} ${capitalize(kind)} Demon${n === 1 ? '' : 's'}`);
+      }
+    }
+    const cp = snap.cp - prev.cp;
+    if (cp > 0) {
+      base += cp * GD_CP_REWARD;
+      gains.push(`${cp} creator point${cp === 1 ? '' : 's'}`);
+    }
+  }
+  q.setGdStats.run({ uid, account: link.account_id, ...snap, ts: nowSec() });
+
+  const notes = [];
+  const granted = base > 0 ? mintTx(uid, Math.floor(base * payoutMultiplier())) : 0;
+  if (granted > 0) afterEarn(uid, firstGuildId(), ['gd'], granted, notes);
+  for (const [stat, value] of [['gd_stars', snap.stars], ['gd_moons', snap.moons], ['gd_demons', snap.demons], ['gd_extreme', snap.extreme], ['gd_cp', snap.cp]]) {
+    bumpStat(uid, stat, value, notes, 'max');
+  }
+  if (notify && (granted > 0 || notes.length)) {
+    const user = await client.users.fetch(uid).catch(() => null);
+    const text = granted > 0 ? `Since the last check you got ${gains.join(', ')} on Geometry Dash and earned **${fmt(granted)}** ${ORB}!` : 'Your Geometry Dash progress unlocked something:';
+    await user?.send({ embeds: [embed(withNotes(text, notes), '🎮 GD progress')] }).catch(() => {});
+  }
+  return { fresh, gains, granted, notes, snap };
+}
+
+// Background re-checks: a few accounts at a time, oldest first.
+async function gdSyncTick() {
+  for (const { user_id } of q.gdDue.all(nowSec() - GD_SYNC_HOURS * 3600, GD_SYNC_BATCH)) {
+    await syncGdAccount(user_id, { notify: true }).catch((err) => console.error(`GD sync for ${user_id} failed:`, err.message));
+  }
+}
+
+const GD_TOP_STATS = { stars: 'Stars', demons: 'Demons', moons: 'Moons', extreme: 'Extreme Demons', cp: 'Creator points' };
+const gdTopQuery = Object.fromEntries(
+  Object.keys(GD_TOP_STATS).map((col) => [
+    col,
+    db.prepare(`SELECT s.user_id, l.username, s.${col} AS v FROM gd_stats s JOIN gd_links l ON l.user_id = s.user_id AND l.verified = 1 AND l.account_id = s.account_id WHERE s.${col} > 0 ORDER BY v DESC LIMIT 10`),
+  ])
+);
+
+async function handleGdSync(i) {
+  const uid = i.user.id;
+  const link = q.getLink.get(uid);
+  if (!link?.verified) return fail(i, 'Link your Geometry Dash account first with `/gd link`.');
+  const now = nowSec();
+  const last = q.getCd.get(uid, 'gdsync')?.ts ?? 0;
+  if (now < last + GD_MANUAL_SYNC_MINUTES * 60) return fail(i, `You can check again <t:${last + GD_MANUAL_SYNC_MINUTES * 60}:R>. Accounts are also checked automatically every ${GD_SYNC_HOURS}h.`);
+  q.setCd.run(uid, 'gdsync', now);
+  await i.deferReply({ flags: EPH });
+  const r = await syncGdAccount(uid);
+  if (r.error) return fail(i, `Your GD account ${r.error}.`);
+  const text = r.fresh
+    ? `Recorded your starting point as **${link.username}**. Demons you beat from now on pay out.`
+    : r.granted > 0
+      ? `You got ${r.gains.join(', ')} since the last check and earned **${fmt(r.granted)}** ${ORB}!`
+      : 'Nothing new since the last check. Beat some demons and come back!';
+  return i.editReply({ embeds: [embed(withNotes(text, r.notes), '🎮 GD progress')] });
+}
+
+async function handleGdTop(i) {
+  const stat = i.options.getString('stat') ?? 'stars';
+  const rows = gdTopQuery[stat].all();
+  const medals = ['🥇', '🥈', '🥉'];
+  const text = rows.length
+    ? rows.map((r, n) => `${medals[n] ?? `**${n + 1}.**`} <@${r.user_id}> (${r.username}) — ${fmt(r.v)}`).join('\n')
+    : 'Nobody has linked a GD account yet. Use `/gd link`!';
+  return i.reply({ embeds: [embed(`${text}\n\nOnly linked accounts appear, as of their last check.`, `🏆 GD leaderboard: ${GD_TOP_STATS[stat]}`)] });
+}
+
+// A level as a short card.
+function levelCard(l) {
+  const next = Number.isFinite(l.nextDaily) && l.nextDaily > 0 ? `\nNext one <t:${nowSec() + l.nextDaily}:R>` : '';
+  return [
+    `**${l.name}** by ${l.author} · ID \`${l.id}\``,
+    `${l.difficulty}${l.stars ? ` · ${l.stars}${l.platformer ? '🌙' : '★'}` : ''} · ${l.length}`,
+    `⬇️ ${fmt(l.downloads ?? 0)} downloads · 👍 ${fmt(l.likes ?? 0)} likes`,
+    l.songName ? `🎵 ${l.songName}` : null,
+    l.description ? `> ${String(l.description).replace(/\s+/g, ' ').slice(0, 200)}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n') + next;
+}
+
+// Posts the Daily Level and Weekly Demon whenever they change.
+async function gdLevelTick() {
+  if (!EVENT_CHANNEL_ID) return;
+  for (const kind of ['daily', 'weekly']) {
+    const lvl = await fetchJson(`https://gdbrowser.com/api/level/${kind}`).catch(() => null);
+    if (!lvl?.id || typeof lvl.name !== 'string') continue;
+    const key = `gd_${kind}_id`;
+    if (q.getMeta.get(key)?.value === String(lvl.id)) continue;
+    q.setMeta.run(key, String(lvl.id));
+    await announce(levelCard(lvl), kind === 'daily' ? '📅 New Daily Level' : '😈 New Weekly Demon');
+  }
+}
+
+async function handleLevelInfo(i) {
+  const query = i.options.getString('level').trim();
+  await i.deferReply();
+  const lvl = /^\d{1,12}$/.test(query)
+    ? await fetchJson(`https://gdbrowser.com/api/level/${query}`).catch(() => null)
+    : (await fetchJson(`https://gdbrowser.com/api/search/${encodeURIComponent(query)}?count=1`).catch(() => null))?.[0];
+  if (!lvl?.id || typeof lvl.name !== 'string') return fail(i, "I couldn't find that level, or the GD servers didn't answer.");
+  return i.editReply({ embeds: [embed(levelCard(lvl), '🎮 Level info')] });
+}
+
+/* Guess the level */
+
+const guesses = new Map(); // id -> live round (in memory)
+let guessPool = { at: 0, levels: [] };
+
+// Real levels to guess from: Hall of Fame, featured, trending and awarded. Refreshed every 6h.
+async function loadGuessPool() {
+  if (Date.now() - guessPool.at < 6 * 3600 * 1000 && guessPool.levels.length >= 8) return guessPool.levels;
+  const urls = ['type=hof', 'type=featured', 'type=featured&page=1', 'type=trending', 'type=awarded'].map((t) => `https://gdbrowser.com/api/search/*?${t}&count=10`);
+  const lists = await Promise.all(urls.map((u) => fetchJson(u).catch(() => [])));
+  const seen = new Set();
+  const levels = lists.flat().filter((l) => {
+    const key = String(l?.name ?? '').toLowerCase();
+    if (!key || key.length > 60 || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (levels.length >= 8) guessPool = { at: Date.now(), levels };
+  return levels.length >= 8 ? levels : guessPool.levels;
+}
+
+function guessClues(l) {
+  const hide = (text) => String(text ?? '').replace(new RegExp(l.name.replace(/[.*+?^${}()|[\]\\]/g, '\\/* ───────────── Help ───────────── */'), 'gi'), '███');
+  return [
+    `👤 Made by **${l.author}**`,
+    `💀 ${l.difficulty}${l.stars ? ` · ${l.stars}${l.platformer ? '🌙' : '★'}` : ''} · ${l.length}`,
+    `⬇️ ${fmt(l.downloads ?? 0)} downloads · 👍 ${fmt(l.likes ?? 0)} likes`,
+    l.songName ? `🎵 ${hide(l.songName)}` : null,
+    l.description ? `> ${hide(l.description).replace(/\s+/g, ' ').slice(0, 180)}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function handleGuess(i) {
+  const uid = i.user.id;
+  const now = nowSec();
+  const last = q.getCd.get(uid, 'guess')?.ts ?? 0;
+  if (now < last + GUESS_COOLDOWN) return fail(i, `You can guess again <t:${last + GUESS_COOLDOWN}:R>.`);
+  if ([...guesses.values()].some((g) => g.uid === uid)) return fail(i, 'Finish your current guess first.');
+  await i.deferReply();
+  const pool = await loadGuessPool();
+  if (pool.length < 4) return fail(i, "I couldn't load levels from the GD servers right now. Try again soon.");
+  q.setCd.run(uid, 'guess', now);
+
+  const target = pick(pool);
+  const options = shuffle([target, ...shuffle(pool.filter((l) => l.name.toLowerCase() !== target.name.toLowerCase())).slice(0, 3)]);
+  const id = Math.random().toString(36).slice(2, 10);
+  const reward = Math.floor(rand(GUESS_REWARD[0], GUESS_REWARD[1]) * payoutMultiplier());
+  const g = { uid, target, reward, origin: i, answer: options.indexOf(target) };
+  g.timer = setTimeout(() => {
+    if (!guesses.delete(id)) return;
+    i.editReply({ embeds: [embed(`⏰ Time's up! It was **${target.name}** by ${target.author}.`, '🔎 Guess the level')], components: [] }).catch(() => {});
+  }, GUESS_SECONDS * 1000);
+  guesses.set(id, g);
+  const row = new ActionRowBuilder().addComponents(
+    options.map((l, n) => new ButtonBuilder().setCustomId(`gs:${id}:${n}`).setLabel(l.name.slice(0, 80)).setStyle(ButtonStyle.Secondary))
+  );
+  return i.editReply({
+    embeds: [embed(`${guessClues(target)}\n\nWhich level is it? Answer within **${GUESS_SECONDS}s** for **${fmt(reward)}** ${ORB}.`, '🔎 Guess the level')],
+    components: [row],
+  });
+}
+
+async function handleGuessButton(i) {
+  const [, id, choice] = i.customId.split(':');
+  const g = guesses.get(id);
+  if (!g) return i.reply({ content: '❌ This round is over.', flags: EPH });
+  if (g.uid !== i.user.id) return i.reply({ content: "❌ This isn't your round. Start one with `/guess`.", flags: EPH });
+  guesses.delete(id);
+  clearTimeout(g.timer);
+  if (Number(choice) !== g.answer) {
+    return i.update({ embeds: [embed(`❌ Nope! It was **${g.target.name}** by ${g.target.author}.`, '🔎 Guess the level')], components: [] });
+  }
+  const granted = mintTx(g.uid, g.reward);
+  const notes = granted > 0 ? afterEarn(g.uid, i.guildId, ['guess'], granted) : [];
+  return i.update({
+    embeds: [embed(withNotes(`✅ It was **${g.target.name}** by ${g.target.author}! You earned **${fmt(granted)}** ${ORB}.`, notes), '🔎 Guess the level')],
+    components: [],
+  });
+}
+
+/* Demonlist */
+
+let demonlistCache = { at: 0, list: [] };
+async function fetchDemonlist() {
+  const list = await fetchJson('https://pointercrate.com/api/v2/demons/listed/?limit=100', 30_000);
+  demonlistCache = { at: Date.now(), list: list.map((d) => ({ id: d.id, name: d.name, position: d.position })) };
+  return demonlistCache.list;
+}
+
+// Announces a new #1 and new entries into the top 10.
+async function demonlistTick() {
+  const list = await fetchDemonlist().catch((err) => {
+    console.error(`Demonlist check failed: ${err.message}`);
+    return null;
+  });
+  if (!list?.length) return;
+  const top = list.slice(0, 10);
+  const prev = JSON.parse(q.getMeta.get('demonlist_top')?.value ?? 'null');
+  q.setMeta.run('demonlist_top', JSON.stringify(top));
+  if (!prev?.length || !EVENT_CHANNEL_ID) return;
+  const lines = [];
+  const newTop = prev[0]?.id !== top[0].id;
+  if (newTop) lines.push(`👑 **${top[0].name}** is the new #1 on the Demonlist, taking the spot from **${prev[0].name}**!`);
+  const before = new Set(prev.map((d) => d.id));
+  for (const d of top) if (!before.has(d.id) && !(newTop && d.id === top[0].id)) lines.push(`🆕 **${d.name}** entered the top 10 at **#${d.position}**.`);
+  if (lines.length) await announce(lines.join('\n'), '📋 Demonlist update');
+}
+
+/* Demonlist predictions: players bet against each other, so no orbs are created */
+
+const weekStart = (week) => weekEnd(week) - 7 * DAY_SECONDS;
+const bettingClosesAt = (week) => weekStart(week) + PREDICT_OPEN_DAYS * DAY_SECONDS;
+const SIDE_LABEL = { up: '📈 moves up', down: '📉 moves down', same: '➡️ stays put' };
+
+const betTx = db.transaction((uid, week, d, side, amount, now) => {
+  q.ensure.run(uid);
+  if (getBalance(uid) < amount) return false;
+  q.sub.run(amount, uid);
+  q.newMarket.run(week, d.id, d.name, d.position);
+  q.addBet.run(week, d.id, uid, side, amount, now);
+  return true;
+});
+
+// Winners split the whole pool (minus the fee) by stake. If nobody picked the outcome, everyone is refunded.
+const settleMarketTx = db.transaction((week, demonId, outcome) => {
+  const bets = q.betsOn.all(week, demonId);
+  const total = bets.reduce((n, b) => n + b.amount, 0);
+  const winners = bets.filter((b) => b.side === outcome);
+  const winTotal = winners.reduce((n, b) => n + b.amount, 0);
+  const paid = new Map();
+  const pay = (uid, amt) => {
+    if (amt <= 0) return;
+    q.ensure.run(uid);
+    q.refund.run(amt, uid);
+    paid.set(uid, (paid.get(uid) ?? 0) + amt);
+  };
+  if (!winTotal) {
+    for (const b of bets) pay(b.user_id, b.amount);
+    return { total, refunded: true, paid };
+  }
+  const pot = Math.floor(total * (1 - PREDICT_FEE));
+  for (const b of winners) pay(b.user_id, Math.floor((pot * b.amount) / winTotal));
+  return { total, refunded: false, paid };
+});
+
+async function demonAutocomplete(i) {
+  const typed = i.options.getFocused().toLowerCase();
+  const choices = demonlistCache.list
+    .slice(0, PREDICT_TOP)
+    .filter((d) => d.name.toLowerCase().includes(typed))
+    .slice(0, 25)
+    .map((d) => ({ name: `#${d.position} ${d.name}`, value: String(d.id) }));
+  return i.respond(choices);
+}
+
+async function handlePredict(i) {
+  const sub = i.options.getSubcommand();
+  const uid = i.user.id;
+  const week = weekIndex();
+
+  if (sub === 'info') {
+    const markets = q.marketsOf.all(week);
+    const lines = markets.map((m) => {
+      const pools = Object.fromEntries(['up', 'down', 'same'].map((s) => [s, q.poolOf.get(week, m.demon_id, s).n]));
+      const nowPos = demonlistCache.list.find((d) => d.id === m.demon_id)?.position;
+      return `**${m.name}** (was #${m.start_pos}${nowPos ? `, now #${nowPos}` : ''}): 📈 ${fmt(pools.up)} · 📉 ${fmt(pools.down)} · ➡️ ${fmt(pools.same)}`;
+    });
+    const mine = q.betsBy.all(week, uid).map((b) => `${fmt(b.amount)} on **${b.name}** ${SIDE_LABEL[b.side]}`);
+    const open = nowSec() < bettingClosesAt(week);
+    return i.reply({
+      embeds: [
+        embed(
+          `${lines.join('\n') || 'No bets yet this week.'}\n\n**Your bets**\n${mine.join('\n') || 'None'}\n\n` +
+            `${open ? `Betting closes <t:${bettingClosesAt(week)}:R>.` : `Betting is closed until <t:${weekEnd(week)}:R>.`} Results come in <t:${weekEnd(week)}:R>, compared with each demon's position when its first bet was placed. ` +
+            `Winners split the pool (minus ${PREDICT_FEE * 100}%) by stake.`,
+          '🔮 Demonlist predictions'
+        ),
+      ],
+    });
+  }
+
+  // bet
+  if (nowSec() >= bettingClosesAt(week)) return fail(i, `Betting for this week closed. The next round opens <t:${weekEnd(week)}:R>.`);
+  const amount = i.options.getInteger('amount');
+  const side = i.options.getString('side');
+  const picked = i.options.getString('demon').trim();
+  await i.deferReply();
+  const list = (await fetchDemonlist().catch(() => null)) ?? (Date.now() - demonlistCache.at < 3600_000 ? demonlistCache.list : null);
+  if (!list) return fail(i, "I couldn't reach the Demonlist. Try again soon.");
+  const top = list.slice(0, PREDICT_TOP);
+  const d = top.find((x) => String(x.id) === picked) ?? top.find((x) => x.name.toLowerCase() === picked.toLowerCase());
+  if (!d) return fail(i, `Pick one of the top ${PREDICT_TOP} demons from the list.`);
+  const market = q.getMarket.get(week, d.id);
+  if (!betTx(uid, week, d, side, amount, nowSec())) return fail(i, `You only have **${fmt(getBalance(uid))}** ${ORB}.`);
+  const start = market?.start_pos ?? d.position;
+  return i.editReply({
+    embeds: [
+      embed(
+        `${i.user} bet **${fmt(amount)}** ${ORB} that **${d.name}** ${SIDE_LABEL[side]} from **#${start}** by <t:${weekEnd(week)}:f>.\n\`/predict info\` shows every pool.`,
+        '🔮 Prediction placed'
+      ),
+    ],
+  });
+}
+
+// Settles finished weeks once the Demonlist can be read.
+async function predictTick() {
+  const current = weekIndex();
+  const saved = q.getMeta.get('predict_done');
+  if (!saved) return q.setMeta.run('predict_done', String(current - 1));
+  const week = Number(saved.value) + 1;
+  if (week >= current) return;
+  const markets = q.marketsOf.all(week);
+  if (markets.length) {
+    const list = await fetchDemonlist().catch(() => null);
+    if (!list) return; // try again next time
+    const lines = [];
+    for (const m of markets) {
+      const now = list.find((d) => d.id === m.demon_id);
+      const outcome = !now ? 'down' : now.position < m.start_pos ? 'up' : now.position > m.start_pos ? 'down' : 'same';
+      const r = settleMarketTx(week, m.demon_id, outcome);
+      for (const uid of r.paid.keys()) if (!r.refunded) bumpStat(uid, 'predict_wins', 1, []);
+      const result = r.refunded ? 'nobody called it, so everyone was refunded' : `${r.paid.size} winner${r.paid.size === 1 ? '' : 's'} split **${fmt(Math.floor(r.total * (1 - PREDICT_FEE)))}** ${ORB}`;
+      lines.push(`**${m.name}** went #${m.start_pos} → ${now ? `#${now.position}` : 'off the top 100'} (${SIDE_LABEL[outcome]}): ${result}.`);
+    }
+    await announce(lines.join('\n'), '🔮 Prediction results');
+  }
+  q.setMeta.run('predict_done', String(week));
+}
+
 /* ───────────── Help ───────────── */
 
 const HELP_TOPICS = {
@@ -3099,6 +3552,7 @@ const HELP_TOPICS = {
   events: '🎉 Events',
   stocks: '📈 Stocks',
   robbery: '🦹 Robbery',
+  gd: '🎮 Geometry Dash',
   admin: '🛠️ Admin',
 };
 
@@ -3161,6 +3615,19 @@ function helpText(topic) {
       `**Weekly challenge:** a server-wide goal that changes every Monday. Everyone who helps gets paid when it's done. See \`/weekly\`.\n\n` +
       `**Tournaments:** moderators run trivia tournaments. Answer fast and right to win, and the top 3 split the prize.\n\n` +
       `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it, and you're paid by its rating: per star for normal levels, more for harder demons.`
+    );
+  }
+  if (topic === 'gd') {
+    const r = GD_DEMON_REWARDS;
+    return (
+      `**Link your account:** \`/gd link\` then \`/gd verify\`. Every ${GD_SYNC_HOURS}h (or with \`/gd sync\`) the bot checks it and pays for demons you've beaten since: ` +
+      `Easy ${scaled(r.easy)}, Medium ${scaled(r.medium)}, Hard ${scaled(r.hard)}, Insane ${scaled(r.insane)}, Extreme ${scaled(r.extreme)} ${ORB}, plus ${scaled(GD_CP_REWARD)} per creator point. ` +
+      `Your real progress also unlocks badges.\n\n` +
+      `\`/gd top\`: server leaderboard by stars, demons, moons and more\n` +
+      `\`/guess\`: guess a real level from clues (every ${GUESS_COOLDOWN / 60} min)\n` +
+      `\`/levelinfo\`: look up any level\n` +
+      `\`/predict\`: bet whether a top-${PREDICT_TOP} demon moves up, down or stays by the end of the week. Winners split the pool; betting closes ${PREDICT_OPEN_DAYS} days into each week\n\n` +
+      `The new Daily Level, Weekly Demon and Demonlist changes are posted in the event channel.`
     );
   }
   if (topic === 'robbery') {
@@ -3432,7 +3899,7 @@ client.on(Events.InteractionCreate, async (i) => {
   }
   if (i.isButton()) {
     const handler =
-      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton, pol: handlePoliceButton }[i.customId.split(':')[0]] ??
+      { drop: handleDropButton, tn: handleTournamentButton, lotw: handleLotwButton, help: handleHelpButton, stk: handleStockButton, pol: handlePoliceButton, gs: handleGuessButton }[i.customId.split(':')[0]] ??
       handleChallengeButton;
     return handler(i).catch(async (err) => {
       console.error(err);
@@ -3440,7 +3907,7 @@ client.on(Events.InteractionCreate, async (i) => {
       await (i.deferred || i.replied ? i.followUp(msg) : i.reply(msg)).catch(() => {});
     });
   }
-  if (i.isAutocomplete()) return stockAutocomplete(i).catch(console.error);
+  if (i.isAutocomplete()) return (i.commandName === 'predict' ? demonAutocomplete : stockAutocomplete)(i).catch(console.error);
   if (!i.isChatInputCommand()) return;
   if (!i.inGuild()) return fail(i, 'Use me in a server.');
 
@@ -3486,6 +3953,12 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleUse(i);
       case 'stocks':
         return await handleStocks(i);
+      case 'levelinfo':
+        return await handleLevelInfo(i);
+      case 'guess':
+        return await handleGuess(i);
+      case 'predict':
+        return await handlePredict(i);
       case 'gd':
         return await handleGd(i);
       case 'stock':
@@ -3905,6 +4378,10 @@ client.once(Events.ClientReady, async (c) => {
   setInterval(() => seasonTick().catch(console.error), 60 * 1000);
   stockTick().catch(console.error);
   setInterval(() => stockTick().catch(console.error), STOCK_POLL_MINUTES * 60 * 1000);
+  for (const [job, minutes] of [[gdSyncTick, 5], [gdLevelTick, 30], [demonlistTick, 30], [predictTick, 10]]) {
+    job().catch(console.error);
+    setInterval(() => job().catch(console.error), minutes * 60 * 1000);
+  }
 });
 
 checkDiscordReachable();
