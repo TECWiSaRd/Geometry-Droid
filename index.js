@@ -1199,23 +1199,11 @@ const commands = [
         .setName('propose')
         .setDescription(`Suggest a level to list (needs ${fmt(STOCK_MIN_DOWNLOADS)}+ downloads; moderators approve)`)
         .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('add')
-        .setDescription('List a level right away (Manage Server)')
-        .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
-        .addStringOption((o) => o.setName('symbol').setDescription('2-5 letters (default: made from the name)').setMinLength(2).setMaxLength(5))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('remove')
-        .setDescription('Delist a stock and pay holders the last price (Manage Server)')
-        .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
     ),
   new SlashCommandBuilder()
     .setName('debug')
     .setDescription('Open the engineer panel (engineer role only)')
+    .setDefaultMemberPermissions(0)
     .addStringOption((o) =>
       o
         .setName('section')
@@ -1229,10 +1217,6 @@ const commands = [
           { name: 'Config', value: 'config' }
         )
     ),
-  new SlashCommandBuilder()
-    .setName('drop')
-    .setDescription('Drop an orb right now (Manage Server)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName('rob')
     .setDescription(`Steal from someone's wallet (${ROB_SUCCESS * 100}% chance; caught = fine + ${ROB_JAIL / 3600}h ban)`)
@@ -1297,14 +1281,7 @@ const commands = [
     .addSubcommand((s) => s.setName('top').setDescription('Top clans')),
   new SlashCommandBuilder()
     .setName('raid')
-    .setDescription('Fight the raid boss together')
-    .addSubcommand((s) => s.setName('status').setDescription('Boss HP and top hitters'))
-    .addSubcommand((s) => s.setName('start').setDescription('Summon a boss in this channel now (Manage Server)')),
-  new SlashCommandBuilder()
-    .setName('tournament')
-    .setDescription('Start a trivia tournament in this channel')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10)),
+    .setDescription('Raid boss HP and the top hitters'),
   new SlashCommandBuilder().setName('weekly').setDescription("See this week's server-wide challenge"),
   new SlashCommandBuilder().setName('season').setDescription('Season standings and your season pass'),
   new SlashCommandBuilder()
@@ -1316,22 +1293,7 @@ const commands = [
         .setName('submit')
         .setDescription('Send proof that you beat it')
         .addAttachmentOption((o) => o.setName('proof').setDescription('Screenshot or video of the clear').setRequired(true))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('set')
-        .setDescription('Feature a level (Manage Server). Name, stars and difficulty are looked up automatically')
-        .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
-        .addStringOption((o) => o.setName('name').setDescription('Override the level name'))
-        .addIntegerOption((o) => o.setName('stars').setDescription('Override the star rating (non-demons pay per star)').setMinValue(1).setMaxValue(10))
-        .addStringOption((o) =>
-          o
-            .setName('difficulty')
-            .setDescription('Override the demon difficulty (demons pay by difficulty)')
-            .addChoices({ name: 'Not a demon', value: 'none' }, ...Object.keys(LOTW_DEMON_REWARDS).map((d) => ({ name: d, value: d })))
-        )
-    )
-    .addSubcommand((s) => s.setName('end').setDescription('Stop featuring the level (Manage Server)')),
+    ),
   new SlashCommandBuilder()
     .setName('coins')
     .setDescription('See your Secret Coin collection')
@@ -1342,23 +1304,71 @@ const commands = [
     .addUserOption((o) => o.setName('user').setDescription('Someone else')),
   new SlashCommandBuilder().setName('prestige').setDescription(`Reset your level for a permanent payout bonus (needs level ${MAX_LEVEL})`),
   new SlashCommandBuilder()
-    .setName('salary')
-    .setDescription('Manage automatic role payments')
+    .setName('mod')
+    .setDescription('Moderator tools')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand((s) => s.setName('drop').setDescription('Drop an orb right now (in the drop channel, or here if none is set)'))
     .addSubcommand((s) =>
       s
-        .setName('set')
-        .setDescription('Set the payout for a role')
-        .addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true))
-        .addIntegerOption((o) => o.setName('amount').setDescription('Orbs per payout').setRequired(true).setMinValue(1))
+        .setName('tournament')
+        .setDescription('Start a trivia tournament in this channel')
+        .addIntegerOption((o) => o.setName('rounds').setDescription(`Number of questions (default ${TOURNEY_ROUNDS})`).setMinValue(3).setMaxValue(10))
     )
-    .addSubcommand((s) =>
-      s
-        .setName('remove')
-        .setDescription('Remove a role payout')
-        .addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true))
+    .addSubcommand((s) => s.setName('raid').setDescription('Summon a raid boss in this channel now'))
+    .addSubcommandGroup((g) =>
+      g
+        .setName('lotw')
+        .setDescription('Level of the Week')
+        .addSubcommand((s) =>
+          s
+            .setName('set')
+            .setDescription('Feature a level. Name, stars and difficulty are looked up automatically')
+            .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
+            .addStringOption((o) => o.setName('name').setDescription('Override the level name'))
+            .addIntegerOption((o) => o.setName('stars').setDescription('Override the star rating (non-demons pay per star)').setMinValue(1).setMaxValue(10))
+            .addStringOption((o) =>
+              o
+                .setName('difficulty')
+                .setDescription('Override the demon difficulty (demons pay by difficulty)')
+                .addChoices({ name: 'Not a demon', value: 'none' }, ...Object.keys(LOTW_DEMON_REWARDS).map((d) => ({ name: d, value: d })))
+            )
+        )
+        .addSubcommand((s) => s.setName('end').setDescription('Stop featuring the level'))
     )
-    .addSubcommand((s) => s.setName('list').setDescription('Show role payouts')),
+    .addSubcommandGroup((g) =>
+      g
+        .setName('stock')
+        .setDescription('Stock listings')
+        .addSubcommand((s) =>
+          s
+            .setName('add')
+            .setDescription('List a level right away (also lists one waiting for approval)')
+            .addStringOption((o) => o.setName('level_id').setDescription('Geometry Dash level ID').setRequired(true))
+            .addStringOption((o) => o.setName('symbol').setDescription('2-5 letters (default: made from the name)').setMinLength(2).setMaxLength(5))
+        )
+        .addSubcommand((s) =>
+          s
+            .setName('remove')
+            .setDescription('Delist a stock and pay holders the last price')
+            .addStringOption((o) => o.setName('symbol').setDescription('Which stock').setRequired(true).setAutocomplete(true))
+        )
+    )
+    .addSubcommandGroup((g) =>
+      g
+        .setName('salary')
+        .setDescription('Automatic role payments')
+        .addSubcommand((s) =>
+          s
+            .setName('set')
+            .setDescription('Set the payout for a role')
+            .addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true))
+            .addIntegerOption((o) => o.setName('amount').setDescription('Orbs per payout').setRequired(true).setMinValue(1))
+        )
+        .addSubcommand((s) =>
+          s.setName('remove').setDescription('Remove a role payout').addRoleOption((o) => o.setName('role').setDescription('Role').setRequired(true))
+        )
+        .addSubcommand((s) => s.setName('list').setDescription('Show role payouts'))
+    ),
 ].map((c) => c.toJSON());
 
 /* ───────────── Anti-bot challenges ───────────── */
@@ -1759,7 +1769,7 @@ async function handleSalary(i) {
   const rows = q.salaries.all(i.guildId);
   const text = rows.length
     ? rows.map((r) => `<@&${r.role_id}> — **${fmt(r.amount)}** ${ORB}`).join('\n')
-    : 'No role payouts set. Use `/salary set`.';
+    : 'No role payouts set. Use `/mod salary set`.';
   return i.reply({ embeds: [embed(`${text}\n\nPaid every ${SALARY_INTERVAL_MIN} min. Members with several paid roles get the highest one.`, '💼 Role salaries')] });
 }
 
@@ -1968,7 +1978,7 @@ const raidEmbed = (raid) =>
   embed(
     `${hpBar(raid.hp, raid.max_hp)}\nHP: **${fmt(raid.hp)}** / ${fmt(raid.max_hp)}\n\n` +
       `Every earn command, \`/daily\` and drop win hits the boss. Defeat it <t:${raid.ends}:R> to split ` +
-      `**${fmt(Math.floor(RAID_POOL * payoutMultiplier()))}** ${ORB} by damage dealt. \`/raid status\` shows the top hitters.`,
+      `**${fmt(Math.floor(RAID_POOL * payoutMultiplier()))}** ${ORB} by damage dealt. \`/raid\` shows the top hitters.`,
     `⚔️ Raid: ${raid.boss}`
   );
 
@@ -2063,17 +2073,16 @@ async function raidTick() {
   }
 }
 
-async function handleRaid(i) {
-  const sub = i.options.getSubcommand();
+// /mod raid
+async function startRaidHere(i) {
   const raid = q.getRaid.get(i.guildId);
+  if (raid) return fail(i, `**${raid.boss}** is already rampaging.`);
+  await i.reply({ content: 'Summoning a raid boss…', flags: EPH });
+  await startRaid(i.guild, i.channel);
+}
 
-  if (sub === 'start') {
-    if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) return fail(i, 'You need Manage Server for that.');
-    if (raid) return fail(i, `**${raid.boss}** is already rampaging.`);
-    await i.reply({ content: 'Summoning a raid boss…', flags: EPH });
-    await startRaid(i.guild, i.channel);
-    return;
-  }
+async function handleRaid(i) {
+  const raid = q.getRaid.get(i.guildId);
 
   if (!raid) {
     const next = Number(q.getMeta.get(`raid_next:${i.guildId}`)?.value ?? 0);
@@ -2479,7 +2488,7 @@ async function handleLotw(i) {
     return i.reply({ embeds: [embed(`**${level.name}** is no longer the Level of the Week. Pending proofs can still be reviewed.`, '🎮 Level of the Week')] });
   }
 
-  if (!level) return fail(i, 'There is no Level of the Week right now. A moderator can set one with `/lotw set`.');
+  if (!level) return fail(i, 'There is no Level of the Week right now. A moderator can set one with `/mod lotw set`.');
 
   if (sub === 'info') {
     const clears = q.clearCount.get(i.guildId, level.level_id).n;
@@ -2899,7 +2908,7 @@ async function handleStockButton(i) {
     await closeReviews('stock', sym, done, i.message?.id);
     return tellPlayer(st.proposer, `Your proposal to list **${st.name}** was not accepted.`, '📈 Listing rejected');
   }
-  if (q.listedCount.get().n >= STOCK_MAX) return deny(`The market is full (${STOCK_MAX}). Remove a stock with \`/stock remove\` first.`);
+  if (q.listedCount.get().n >= STOCK_MAX) return deny(`The market is full (${STOCK_MAX}). Remove a stock with \`/mod stock remove\` first.`);
   if (q.approveStock.run(nowSec(), sym).changes === 0) return deny('Someone already reviewed this one.');
   const listed = q.stockBySym.get(sym);
   announceListing(listed).catch(() => {});
@@ -3063,7 +3072,7 @@ async function handleStock(i) {
       const st = q.stockBySym.get(sym);
       await announceListing(st);
       if (pending) {
-        const done = { content: '', embeds: [embed(`**${sym}** (${name}) was added by ${i.user} with \`/stock add\`. Trading opens <t:${opensAt(st)}:R>.`, '📈 Listing approved')], components: [] };
+        const done = { content: '', embeds: [embed(`**${sym}** (${name}) was added by ${i.user} with \`/mod stock add\`. Trading opens <t:${opensAt(st)}:R>.`, '📈 Listing approved')], components: [] };
         await closeReviews('stock', pending.sym, done);
         if (pending.proposer !== uid) await tellPlayer(pending.proposer, `Your proposal was approved! **${sym}** (${name}) opens for trading <t:${opensAt(st)}:R>.`, '📈 Listing approved');
       }
@@ -3082,7 +3091,7 @@ async function handleStock(i) {
         embed(
           `${i.user} wants to list **${name}** by ${lvl.author} (ID \`${id}\`) as **${sym}**.\n` +
             `Downloads: **${fmt(lvl.downloads)}** · Likes: **${fmt(lvl.likes ?? 0)}** · ${lvl.difficulty ?? 'Unknown'}\n\n` +
-            `If approved, it collects data for ${STOCK_WARMUP_HOURS}h before trading opens. Moderators can pick their own symbol with \`/stock add\` instead.`,
+            `If approved, it collects data for ${STOCK_WARMUP_HOURS}h before trading opens. Moderators can pick their own symbol with \`/mod stock add\` instead.`,
           '📈 Stock proposal'
         ),
       ],
@@ -3611,7 +3620,7 @@ function helpText(topic) {
       `**Orb drops:** an orb appears every ${DROP_MIN_MINUTES}-${DROP_MAX_MINUTES} minutes, and the first to click wins it. ` +
       `After a win, you sit out the next ${DROP_WAIT} drops.\n\n` +
       `**Raids:** a boss shows up every few days. Every earn command, \`/daily\` and drop win hits it. ` +
-      `Beat it within ${RAID_HOURS}h and the reward is split by damage. See \`/raid status\`.\n\n` +
+      `Beat it within ${RAID_HOURS}h and the reward is split by damage. See \`/raid\`.\n\n` +
       `**Weekly challenge:** a server-wide goal that changes every Monday. Everyone who helps gets paid when it's done. See \`/weekly\`.\n\n` +
       `**Tournaments:** moderators run trivia tournaments. Answer fast and right to win, and the top 3 split the prize.\n\n` +
       `**Level of the Week:** beat the featured Geometry Dash level and send proof with \`/lotw submit\`. A moderator verifies it, and you're paid by its rating: per star for normal levels, more for harder demons.`
@@ -3660,14 +3669,15 @@ function helpText(topic) {
   }
   if (topic === 'admin') {
     return (
-      `These need **Manage Server**:\n` +
-      `\`/salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
-      `\`/raid start\`: summon a raid boss in the current channel\n` +
-      `\`/tournament\`: run a trivia tournament in the current channel\n` +
-      `\`/drop\`: drop an orb right now (in the drop channel, or here if none is set)\n` +
-      `\`/debug\`: engineer tools (needs the role in \`ENGINEER_ROLE_ID\`)\n` +
-      `\`/lotw set|end\`: choose the Level of the Week. Clears and stock proposals are sent to every moderator by DM with Approve and Reject buttons\n` +
-      `\`/stock add|remove\`: list a level or delist a stock (holders are paid the last price). \n\n` +
+      `\`/mod\` has the moderator tools. Only members with **Manage Server** can see it:\n` +
+      `\`/mod salary set|remove|list\`: automatic role payments every ${SALARY_INTERVAL_MIN} min\n` +
+      `\`/mod raid\`: summon a raid boss in the current channel\n` +
+      `\`/mod tournament\`: run a trivia tournament in the current channel\n` +
+      `\`/mod drop\`: drop an orb right now (in the drop channel, or here if none is set)\n` +
+      `\`/mod lotw set|end\`: choose the Level of the Week\n` +
+      `\`/mod stock add|remove\`: list a level or delist a stock (holders are paid the last price)\n` +
+      `Clears and stock proposals are sent to every moderator by DM with Approve and Reject buttons.\n\n` +
+      `\`/debug\` is the engineer panel. It's hidden from everyone but admins until you allow your engineer role in **Server Settings → Integrations**, and also needs the role in \`ENGINEER_ROLE_ID\`.\n\n` +
       `Optional settings: \`DROP_CHANNEL_ID\` (drops), \`EVENT_CHANNEL_ID\` (raids and announcements), \`REVIEW_CHANNEL_ID\` (stock proposals and clears), ` +
       `\`SEASON_ROLE_ID\` (season champion). See the README.`
     );
@@ -3965,8 +3975,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleStock(i);
       case 'debug':
         return await handleDebug(i);
-      case 'drop':
-        return await handleDrop(i);
+      case 'mod':
+        return await handleMod(i);
       case 'rob':
         return await handleRob(i);
       case 'bank':
@@ -4001,8 +4011,6 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleRaid(i);
       case 'coins':
         return await handleCoins(i);
-      case 'tournament':
-        return await handleTournament(i);
       case 'weekly':
         return await handleWeekly(i);
       case 'season':
@@ -4013,8 +4021,6 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleHelp(i);
       case 'prestige':
         return await handlePrestige(i);
-      case 'salary':
-        return await handleSalary(i);
     }
   } catch (err) {
     console.error(err);
@@ -4025,6 +4031,21 @@ client.on(Events.InteractionCreate, async (i) => {
 });
 
 /* ───────────── Auto payments ───────────── */
+
+/* ───────────── Moderator tools ───────────── */
+
+// /mod is hidden from members without Manage Server, and still checked here.
+async function handleMod(i) {
+  if (!isMod(i)) return fail(i, 'You need Manage Server for that.');
+  const group = i.options.getSubcommandGroup(false);
+  const sub = i.options.getSubcommand();
+  if (group === 'lotw') return handleLotw(i); // set | end
+  if (group === 'stock') return handleStock(i); // add | remove
+  if (group === 'salary') return handleSalary(i); // set | remove | list
+  if (sub === 'drop') return handleDrop(i);
+  if (sub === 'tournament') return handleTournament(i);
+  return startRaidHere(i);
+}
 
 /* ───────────── Engineer panel ───────────── */
 
@@ -4218,14 +4239,14 @@ async function timedFetch(url, timeoutMs) {
 
 async function runJob(job, guildId) {
   if (job === 'drop') {
-    if (!DROP_CHANNEL_ID) return 'Orb drops are off (no `DROP_CHANNEL_ID`). Use `/drop` to drop one in a channel.';
+    if (!DROP_CHANNEL_ID) return 'Orb drops are off (no `DROP_CHANNEL_ID`). Use `/mod drop` to drop one in a channel.';
     q.setMeta.run('drop_next', String(nowSec()));
     await dropTick();
     return 'Ran the orb drop job. If nothing appeared, check Logs.';
   }
   if (job === 'raid') {
     if (q.getRaid.get(guildId)) return 'A raid is already active.';
-    if (!EVENT_CHANNEL_ID) return 'Raids need `EVENT_CHANNEL_ID`. Use `/raid start` to start one in a channel.';
+    if (!EVENT_CHANNEL_ID) return 'Raids need `EVENT_CHANNEL_ID`. Use `/mod raid` to start one in a channel.';
     q.setMeta.run(`raid_next:${guildId}`, String(nowSec()));
     await raidTick();
     return q.getRaid.get(guildId) ? '⚔️ A raid boss spawned.' : 'No raid spawned. Check Logs.';
