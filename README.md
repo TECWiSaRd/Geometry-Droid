@@ -5,13 +5,14 @@ Geometry Dash themed Discord economy bot.
 ## Commands
 - `/help [topic]`: private guide with pages for basics, earning, shop, progress, clans, events and admin commands. Numbers come from the live settings
 - `/balance [user]`, `/leaderboard`
+- `/vote`: the top.gg vote link. Each vote pays 2,500 base (scaled; weekend votes count double) and the voter gets a DM. 10 votes unlock the Supporter badge
 - `/work` (5m), `/build` (10m), `/fish` (3m), `/mine` (15m): earn orbs, with rare bonus rolls
 - `/quiz` (3m): answer a Geometry Dash trivia question within 30s. Base 200-500 orbs, scaled by question difficulty (0.5x to 3x). Up to 3 skips reroll the question. Always a challenge; wrong answers count as fails
 - `/pay user amount`: 10% tax (rounded up) goes back to the vault; transfers must be at least 2 orbs
 - `/daily`: claim once per UTC day; consecutive days raise the reward (max bonus at day 10)
 - `/upgrade tool`: Diamond Pickaxe and Good Fishing Rod go up to level 5, raising the random payout bonus and costing more each level
 - `/changelog`: shows the latest commit on GitHub (set `GITHUB_TOKEN` only if the repo is private; `CHANGELOG_REPO` overrides the repo)
-- `/achievements [user]`: 28 one-time achievements (earn counts, quiz streaks, drops, daily streak) that pay a scaled orb reward. `/level` shows your badge count
+- `/achievements [user]`: 29 one-time achievements (earn counts, quiz streaks, drops, daily streak) that pay a scaled orb reward. `/level` shows your badge count
 - `/clan create|invite|join|leave|kick|deposit|upgrade|info|top`: clans of up to 20. Founding costs 25,000 (scales like shop prices). Deposits go into an upgrade fund that can never be withdrawn; the owner spends it on clan levels (up to 5), and each level gives every member +1% on earn payouts. If the owner leaves, the longest-standing member takes over
 - `/raid`: a raid boss spawns in the event channel (`EVENT_CHANNEL_ID`, or `DROP_CHANNEL_ID` if unset) an hour after startup, then 72h after each raid ends. HP is 300 per server member (min 3,000). Earn commands, `/daily` and drop wins hit it (10% crit chance). Defeat it within 48h and a 50,000 pool (scales with payouts) is split by damage. Moderators can start one in the current channel with `/mod raid`
 - `/coins [user]`: 15 Secret Coins, three per earn command (named after the first five official levels). Each paid earn has a 3% chance to find one you are missing. Completing a set pays 5,000 (scales with payouts); finding all 15 unlocks the Completionist achievement
@@ -70,6 +71,7 @@ SALARY_INTERVAL_MINUTES=60
 # SEASON_ROLE_ID=role-id              given to each season's #1 (the bot's role must be above it)
 # GITHUB_TOKEN=token                  only needed for /changelog if the repo is private
 # ENGINEER_ROLE_ID=role-id            members with this role can use /debug
+# TOPGG_WEBHOOK_SECRET=whs_...        turns on top.gg vote rewards (see below)
 ```
 
 The bot needs View Channel, Send Messages, Embed Links and Attach Files in the drop, event and review channels.
@@ -77,6 +79,14 @@ The bot needs View Channel, Send Messages, Embed Links and Attach Files in the d
 **Moderator reviews by DM:** Level of the Week proofs and stock proposals are sent by DM to every member with Manage Server (up to 25), with Approve/Reject buttons. When one moderator decides, the other copies are updated, and the player is told the result by DM (or in the event channel if their DMs are closed). If no moderator can be DMed, the request goes to `REVIEW_CHANNEL_ID` / `LOTW_REVIEW_CHANNEL_ID`, or the channel it was made in. Moderators need DMs from server members turned on.
 
 Railway runs `npm start` automatically.
+
+## top.gg vote rewards
+1. In Railway, open the bot's service → **Settings → Networking → Generate Domain**. Railway sets `PORT` itself.
+2. On top.gg, open your bot's page → **Edit → Webhooks**, and set the webhook URL to `https://<your-railway-domain>/topgg`.
+3. Copy the secret top.gg gives you (it starts with `whs_`) into the Railway variable `TOPGG_WEBHOOK_SECRET` and redeploy. (Older top.gg webhooks use an Authorization value you choose instead; put that same value in `TOPGG_WEBHOOK_SECRET`.)
+4. Use top.gg's **Test** button. The bot's log should say `Vote webhook: test received from top.gg`.
+
+Every request is checked against the secret, each vote is paid only once even if top.gg retries, and `GET /` returns `ok` as a health check.
 
 ## Supply
 Circulation is capped at 500,000,000 orbs on launch day, and the cap grows linearly by about 11.1 billion per day, reaching 2 trillion after 180 days (it keeps growing at that rate after). Earn commands and salaries can only mint orbs while circulation is under the cap; orbs spent in the shop go back into the vault. Earn payouts scale up with the cap so the economy keeps pace. `/supply` shows the numbers. Settings are at the top of `index.js`.

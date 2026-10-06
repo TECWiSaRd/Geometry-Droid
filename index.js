@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import http from 'node:http';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   Client,
@@ -89,6 +91,11 @@ const MAX_PRESTIGE = 10;
 const PRESTIGE_BONUS = 0.02; // +2% earn payouts per prestige
 const DROP_CHANNEL_ID = process.env.DROP_CHANNEL_ID; // optional: where orb drops appear
 const ENGINEER_ROLE_ID = process.env.ENGINEER_ROLE_ID; // optional: members with this role can use /debug
+// top.gg vote rewards. TOPGG_WEBHOOK_SECRET is the "whs_..." secret from the top.gg Webhooks page
+// (or, for top.gg's older webhooks, the Authorization value you set there). Votes arrive at /topgg.
+const TOPGG_WEBHOOK_SECRET = process.env.TOPGG_WEBHOOK_SECRET;
+const WEB_PORT = Number(process.env.PORT) || 3000; // Railway sets PORT
+const VOTE_REWARD = 2_500; // base per vote (weekend votes count as 2); scales with payouts
 const DROP_BASE = 1000;
 const DROP_MIN_MINUTES = 20;
 const DROP_MAX_MINUTES = 40;
@@ -427,6 +434,7 @@ const ACHIEVEMENTS = [
   { key: 'gd_stars', name: '⭐ Star Collector', desc: 'Reach 10,000 stars in Geometry Dash (linked account)', stat: 'gd_stars', goal: 10_000, reward: 5_000 },
   { key: 'gd_moons', name: '🌙 Moonwalker', desc: 'Reach 1,000 moons in Geometry Dash (linked account)', stat: 'gd_moons', goal: 1_000, reward: 3_000 },
   { key: 'gd_creator', name: '🛠️ Rated Creator', desc: 'Earn a creator point in Geometry Dash (linked account)', stat: 'gd_cp', goal: 1, reward: 5_000 },
+  { key: 'supporter', name: '🗳️ Supporter', desc: 'Vote for the bot on top.gg 10 times', stat: 'votes', goal: 10, reward: 2_000 },
   { key: 'master_thief', name: '🦹 Master Thief', desc: 'Pull off 10 successful robberies', stat: 'robs', goal: 10, reward: 2_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
@@ -548,6 +556,9 @@ CREATE TABLE IF NOT EXISTS item_uses (
 CREATE TABLE IF NOT EXISTS review_msgs (
   kind TEXT NOT NULL, ref TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL,
   PRIMARY KEY (kind, ref, message_id)
+);
+CREATE TABLE IF NOT EXISTS votes (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, weight INTEGER NOT NULL, ts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS gd_stats (
   user_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -699,6 +710,9 @@ const q = {
   verifyLink: db.prepare('UPDATE gd_links SET verified = 1 WHERE user_id = ?'),
   linkedElsewhere: db.prepare('SELECT user_id FROM gd_links WHERE account_id = ? AND verified = 1 AND user_id != ?'),
   delLink: db.prepare('DELETE FROM gd_links WHERE user_id = ?'),
+  addVote: db.prepare('INSERT OR IGNORE INTO votes (id, user_id, weight, ts) VALUES (?, ?, ?, ?)'),
+  lastVote: db.prepare('SELECT ts FROM votes WHERE user_id = ? ORDER BY ts DESC LIMIT 1'),
+  voteCount: db.prepare('SELECT COUNT(*) AS n FROM votes WHERE user_id = ?'),
   getGdStats: db.prepare('SELECT * FROM gd_stats WHERE user_id = ?'),
   setGdStats: db.prepare(`INSERT OR REPLACE INTO gd_stats (user_id, account_id, stars, moons, demons, cp, easy, medium, hard, insane, extreme, synced_at)
     VALUES (@uid, @account, @stars, @moons, @demons, @cp, @easy, @medium, @hard, @insane, @extreme, @ts)`),
@@ -1236,6 +1250,7 @@ const commands = [
     .setDescription('Your shares, their value and your profit or loss')
     .addUserOption((o) => o.setName('user').setDescription('Someone else')),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Richest players'),
+  new SlashCommandBuilder().setName('vote').setDescription('Vote for the bot on top.gg and get orbs'),
   new SlashCommandBuilder().setName('daily').setDescription('Claim your daily orbs. Keep a streak for bigger rewards'),
   new SlashCommandBuilder()
     .setName('upgrade')
@@ -3685,7 +3700,7 @@ function helpText(topic) {
   return (
     `Mana orbs ${ORB} are this server's currency. Earn them, level up, and spend them in the shop.\n\n` +
     `**Start here**\n\`/daily\` claim free orbs every day\n\`/work\` \`/build\` \`/fish\` \`/mine\` \`/quiz\` earn orbs (each has a cooldown)\n` +
-    `\`/balance\` \`/leaderboard\` check orbs\n\`/shop\` \`/buy\` spend them\n\n` +
+    `\`/balance\` \`/leaderboard\` check orbs\n\`/shop\` \`/buy\` spend them\n\`/vote\` vote for the bot on top.gg for free orbs\n\n` +
     `Pick a topic below to learn more.`
   );
 }
@@ -3975,6 +3990,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return await handleStock(i);
       case 'debug':
         return await handleDebug(i);
+      case 'vote':
+        return await handleVoteCommand(i);
       case 'mod':
         return await handleMod(i);
       case 'rob':
@@ -4031,6 +4048,101 @@ client.on(Events.InteractionCreate, async (i) => {
 });
 
 /* ───────────── Auto payments ───────────── */
+
+/* ───────────── top.gg votes ───────────── */
+
+const voteUrl = () => (client.user ? `https://top.gg/bot/${client.user.id}/vote` : 'https://top.gg');
+
+// True if the request really came from top.gg: the signed format (x-topgg-signature) or the
+// older shared Authorization value.
+function verifyTopgg(headers, raw) {
+  const same = (a, b) => {
+    const x = Buffer.from(String(a));
+    const y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+  };
+  const sig = headers['x-topgg-signature'];
+  if (sig) {
+    const parts = Object.fromEntries(String(sig).split(',').map((p) => p.trim().split('=')));
+    let t = Number(parts.t);
+    if (!t || !parts.v1) return false;
+    if (t > 1e12) t /= 1000; // accept milliseconds too
+    if (Math.abs(Date.now() / 1000 - t) > 300) return false; // old requests could be replays
+    const expected = crypto.createHmac('sha256', TOPGG_WEBHOOK_SECRET).update(`${parts.t}.${raw}`).digest('hex');
+    return same(expected, parts.v1);
+  }
+  return !!headers.authorization && same(headers.authorization, TOPGG_WEBHOOK_SECRET);
+}
+
+// Reads either webhook format. Votes get an ID so top.gg's retries are only paid once.
+function parseVote(body) {
+  if (body?.type === 'vote.create') return { id: `v1:${body.data?.id}`, user: body.data?.user?.platform_id, weight: Number(body.data?.weight) || 1 };
+  if (body?.type === 'upvote') return { id: `v0:${body.user}:${Math.floor(nowSec() / 600)}`, user: body.user, weight: body.isWeekend ? 2 : 1 };
+  if (body?.type === 'webhook.test' || body?.type === 'test') return { test: true, user: body.data?.user?.platform_id ?? body.user };
+  return null;
+}
+
+async function handleVote(body) {
+  const vote = parseVote(body);
+  if (!vote) return console.warn('Vote webhook: unknown payload type', body?.type);
+  if (vote.test) return console.log(`Vote webhook: test received from top.gg (user ${vote.user ?? 'unknown'}). It works!`);
+  if (!/^\d{15,22}$/.test(String(vote.user))) return console.warn('Vote webhook: vote without a valid Discord ID');
+  if (q.addVote.run(vote.id, vote.user, vote.weight, nowSec()).changes === 0) return; // a retry of a vote we already paid
+  const granted = mintTx(vote.user, Math.floor(VOTE_REWARD * vote.weight * payoutMultiplier()));
+  const notes = [];
+  bumpStat(vote.user, 'votes', 1, notes);
+  const weekend = vote.weight > 1 ? ' Weekend votes count double!' : '';
+  const user = await client.users.fetch(vote.user).catch(() => null);
+  await user
+    ?.send({ embeds: [embed(withNotes(`Thanks for voting! You got **${fmt(granted)}** ${ORB}.${weekend} You can vote again in 12 hours.`, notes), '🗳️ Vote reward')] })
+    .catch(() => {});
+}
+
+async function handleVoteCommand(i) {
+  const last = q.lastVote.get(i.user.id)?.ts;
+  const reward = Math.floor(VOTE_REWARD * payoutMultiplier());
+  const status = last ? `Your last vote: <t:${last}:R> · total votes: **${q.voteCount.get(i.user.id).n}**` : "You haven't voted yet.";
+  const off = TOPGG_WEBHOOK_SECRET ? '' : '\n\n⚠️ Vote rewards aren\'t set up on this bot yet, so votes won\'t pay out.';
+  return i.reply({
+    embeds: [embed(`Vote for the bot on top.gg every 12 hours and get **${fmt(reward)}** ${ORB} per vote (double on weekends).\n\n${voteUrl()}\n\n${status}${off}`, '🗳️ Vote')],
+    flags: EPH,
+  });
+}
+
+// A small web server for top.gg's vote webhook (POST /topgg). GET returns "ok" as a health check.
+function startWebServer() {
+  if (!TOPGG_WEBHOOK_SECRET) return console.log('Vote rewards: off (set TOPGG_WEBHOOK_SECRET to turn them on)');
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET') return res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+    if (req.method !== 'POST' || req.url.split('?')[0] !== '/topgg') return res.writeHead(404).end();
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 64 * 1024) {
+        res.writeHead(413).end();
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (res.writableEnded) return;
+      if (!verifyTopgg(req.headers, raw)) {
+        console.warn('Vote webhook: rejected a request that wasn\'t signed by top.gg');
+        return res.writeHead(401).end();
+      }
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return res.writeHead(400).end();
+      }
+      res.writeHead(200).end('ok'); // answer right away; top.gg gives up after 5 seconds
+      handleVote(body).catch((err) => console.error('Vote reward failed:', err));
+    });
+  });
+  server.on('error', (err) => console.error(`Vote rewards: web server failed (${err.message})`));
+  server.listen(WEB_PORT, () => console.log(`Vote rewards: on, listening on port ${WEB_PORT} at /topgg`));
+}
 
 /* ───────────── Moderator tools ───────────── */
 
@@ -4409,6 +4521,7 @@ checkDiscordReachable();
 setTimeout(() => {
   if (!client.isReady()) console.warn('[discord] still not connected after 60s. See the reachability check above.');
 }, 60_000).unref();
+startWebServer();
 console.log('Logging in to Discord…');
 client
   .login(TOKEN)
