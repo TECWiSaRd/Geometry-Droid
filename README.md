@@ -5,7 +5,7 @@ Geometry Dash themed Discord economy bot.
 ## Commands
 - `/help [topic]`: private guide with pages for basics, earning, shop, progress, clans, events and admin commands. Numbers come from the live settings
 - `/balance [user]`, `/leaderboard`
-- `/vote`: the top.gg vote link. Each vote pays 2,500 base (scaled; weekend votes count double) and the voter gets a DM. 10 votes unlock the Supporter badge
+- `/vote`: the vote links for top.gg and Discadia (each shown once it's set up). Each vote on either pays 2,500 base (scaled; top.gg weekend votes count double) and the voter gets a DM. 10 votes unlock the Supporter badge
 - `/work` (5m), `/build` (10m), `/fish` (3m), `/mine` (15m): earn orbs, with rare bonus rolls
 - `/quiz` (3m): answer a Geometry Dash trivia question within 30s. Base 200-500 orbs, scaled by question difficulty (0.5x to 3x). Up to 3 skips reroll the question. Always a challenge; wrong answers count as fails
 - `/pay user amount`: 10% tax (rounded up) goes back to the vault; transfers must be at least 2 orbs
@@ -72,6 +72,8 @@ SALARY_INTERVAL_MINUTES=60
 # GITHUB_TOKEN=token                  only needed for /changelog if the repo is private
 # ENGINEER_ROLE_ID=role-id            members with this role can use /debug
 # TOPGG_WEBHOOK_SECRET=whs_...        turns on top.gg vote rewards (see below)
+# DISCADIA_WEBHOOK_SECRET=long-random-text   turns on Discadia vote rewards (see below)
+# DISCADIA_VOTE_URL=https://discadia.com/vote/your-slug/   optional; the link /vote shows (default: calxgd)
 ```
 
 The bot needs View Channel, Send Messages, Embed Links and Attach Files in the drop, event and review channels.
@@ -87,6 +89,14 @@ Railway runs `npm start` automatically.
 4. Use top.gg's **Test** button. The bot's log should say `Vote webhook: test received from top.gg`.
 
 Every request is checked against the secret, each vote is paid only once even if top.gg retries, and `GET /` returns `ok` as a health check.
+
+## Discadia vote rewards
+Discadia's webhook only takes a URL (no secret field), and its payload (`user_id`, `guild_id`, `server_title`, `server_slug`, `vote_url`) has no signature or vote ID. So you make up a secret yourself and put it in the URL:
+1. Make up a long random secret, for example by running `openssl rand -hex 24`, and put it in the Railway variable `DISCADIA_WEBHOOK_SECRET`. Redeploy.
+2. In your Discadia server's settings, set the webhook URL to `https://<your-railway-domain>/discadia/<that secret>` (the same domain as the top.gg webhook). `https://<your-railway-domain>/discadia?key=<that secret>` works too, but the path form is safer if a form mangles query strings. Anyone who learns the full URL can send fake votes, so keep it private and change the secret if it leaks.
+3. Run a test vote. The Railway log shows `Discadia webhook: received from <ip> · user-agent … · header names: …`. Requests with the wrong key are logged the same way (without the key) and answered with 401, which shows where Discadia's requests really come from.
+
+A request is paid only if the key is right, the `user_id` is a Discord ID, the `guild_id` matches `GUILD_ID` (if set), and that member didn't already get a Discadia vote in the last hour (there is no vote ID to tell retries apart, so the hour is the duplicate window; `DISCADIA_MIN_GAP` in `index.js`). Discadia's own example payload (`example-server`) is logged but never paid. The secret may also be sent as an `Authorization` header instead.
 
 ## Supply
 Circulation is capped at 500,000,000 orbs on launch day, and the cap grows linearly by about 11.1 billion per day, reaching 2 trillion after 180 days (it keeps growing at that rate after). Earn commands and salaries can only mint orbs while circulation is under the cap; orbs spent in the shop go back into the vault. Earn payouts scale up with the cap so the economy keeps pace. `/supply` shows the numbers. Settings are at the top of `index.js`.

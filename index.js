@@ -95,7 +95,12 @@ const ENGINEER_ROLE_ID = process.env.ENGINEER_ROLE_ID; // optional: members with
 // (or, for top.gg's older webhooks, the Authorization value you set there). Votes arrive at /topgg.
 const TOPGG_WEBHOOK_SECRET = process.env.TOPGG_WEBHOOK_SECRET;
 const WEB_PORT = Number(process.env.PORT) || 3000; // Railway sets PORT
-const VOTE_REWARD = 2_500; // base per vote (weekend votes count as 2); scales with payouts
+const VOTE_REWARD = 2_500; // base per vote (weekend votes count as 2); scales with payouts. Same for top.gg and Discadia
+// Discadia server votes arrive at /discadia/<DISCADIA_WEBHOOK_SECRET> (or /discadia?key=<secret>). Its webhook has
+// no secret field and its payload has no signature, so a secret you make up, placed in the URL, proves a request is real.
+const DISCADIA_WEBHOOK_SECRET = process.env.DISCADIA_WEBHOOK_SECRET;
+const DISCADIA_VOTE_URL = process.env.DISCADIA_VOTE_URL || 'https://discadia.com/vote/calxgd/';
+const DISCADIA_MIN_GAP = 60 * 60; // the payload has no vote ID, so a second vote from one member inside this window counts as a duplicate
 const DROP_BASE = 1000;
 const DROP_MIN_MINUTES = 20;
 const DROP_MAX_MINUTES = 40;
@@ -434,7 +439,7 @@ const ACHIEVEMENTS = [
   { key: 'gd_stars', name: '⭐ Star Collector', desc: 'Reach 10,000 stars in Geometry Dash (linked account)', stat: 'gd_stars', goal: 10_000, reward: 5_000 },
   { key: 'gd_moons', name: '🌙 Moonwalker', desc: 'Reach 1,000 moons in Geometry Dash (linked account)', stat: 'gd_moons', goal: 1_000, reward: 3_000 },
   { key: 'gd_creator', name: '🛠️ Rated Creator', desc: 'Earn a creator point in Geometry Dash (linked account)', stat: 'gd_cp', goal: 1, reward: 5_000 },
-  { key: 'supporter', name: '🗳️ Supporter', desc: 'Vote for the bot on top.gg 10 times', stat: 'votes', goal: 10, reward: 2_000 },
+  { key: 'supporter', name: '🗳️ Supporter', desc: 'Vote for us on top.gg or Discadia 10 times', stat: 'votes', goal: 10, reward: 2_000 },
   { key: 'master_thief', name: '🦹 Master Thief', desc: 'Pull off 10 successful robberies', stat: 'robs', goal: 10, reward: 2_000 },
   { key: 'coin_hunter', name: '🪙 Coin Hunter', desc: 'Find 5 Secret Coins', stat: 'coins', goal: 5, reward: 2_000 },
   { key: 'completionist', name: '🏆 Completionist', desc: 'Find all 15 Secret Coins', stat: 'coins', goal: 15, reward: 50_000 },
@@ -712,6 +717,7 @@ const q = {
   delLink: db.prepare('DELETE FROM gd_links WHERE user_id = ?'),
   addVote: db.prepare('INSERT OR IGNORE INTO votes (id, user_id, weight, ts) VALUES (?, ?, ?, ?)'),
   lastVote: db.prepare('SELECT ts FROM votes WHERE user_id = ? ORDER BY ts DESC LIMIT 1'),
+  lastDiscadiaVote: db.prepare("SELECT ts FROM votes WHERE user_id = ? AND id LIKE 'discadia:%' ORDER BY ts DESC LIMIT 1"),
   voteCount: db.prepare('SELECT COUNT(*) AS n FROM votes WHERE user_id = ?'),
   getGdStats: db.prepare('SELECT * FROM gd_stats WHERE user_id = ?'),
   setGdStats: db.prepare(`INSERT OR REPLACE INTO gd_stats (user_id, account_id, stars, moons, demons, cp, easy, medium, hard, insane, extreme, synced_at)
@@ -3700,7 +3706,7 @@ function helpText(topic) {
   return (
     `Mana orbs ${ORB} are this server's currency. Earn them, level up, and spend them in the shop.\n\n` +
     `**Start here**\n\`/daily\` claim free orbs every day\n\`/work\` \`/build\` \`/fish\` \`/mine\` \`/quiz\` earn orbs (each has a cooldown)\n` +
-    `\`/balance\` \`/leaderboard\` check orbs\n\`/shop\` \`/buy\` spend them\n\`/vote\` vote for the bot on top.gg for free orbs\n\n` +
+    `\`/balance\` \`/leaderboard\` check orbs\n\`/shop\` \`/buy\` spend them\n\`/vote\` vote for us on top.gg or Discadia for free orbs\n\n` +
     `Pick a topic below to learn more.`
   );
 }
@@ -4049,18 +4055,19 @@ client.on(Events.InteractionCreate, async (i) => {
 
 /* ───────────── Auto payments ───────────── */
 
-/* ───────────── top.gg votes ───────────── */
+/* ───────────── Votes: top.gg and Discadia ───────────── */
 
 const voteUrl = () => (client.user ? `https://top.gg/bot/${client.user.id}/vote` : 'https://top.gg');
+
+const safeEqual = (a, b) => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
 
 // True if the request really came from top.gg: the signed format (x-topgg-signature) or the
 // older shared Authorization value.
 function verifyTopgg(headers, raw) {
-  const same = (a, b) => {
-    const x = Buffer.from(String(a));
-    const y = Buffer.from(String(b));
-    return x.length === y.length && crypto.timingSafeEqual(x, y);
-  };
   const sig = headers['x-topgg-signature'];
   if (sig) {
     const parts = Object.fromEntries(String(sig).split(',').map((p) => p.trim().split('=')));
@@ -4069,17 +4076,53 @@ function verifyTopgg(headers, raw) {
     if (t > 1e12) t /= 1000; // accept milliseconds too
     if (Math.abs(Date.now() / 1000 - t) > 300) return false; // old requests could be replays
     const expected = crypto.createHmac('sha256', TOPGG_WEBHOOK_SECRET).update(`${parts.t}.${raw}`).digest('hex');
-    return same(expected, parts.v1);
+    return safeEqual(expected, parts.v1);
   }
-  return !!headers.authorization && same(headers.authorization, TOPGG_WEBHOOK_SECRET);
+  return !!headers.authorization && safeEqual(headers.authorization, TOPGG_WEBHOOK_SECRET);
 }
 
-// Reads either webhook format. Votes get an ID so top.gg's retries are only paid once.
+// Discadia: the secret in the URL path (/discadia/<secret>) or query (?key=...), or in an Authorization header.
+function verifyDiscadia(req, url) {
+  let pathKey = '';
+  if (url.pathname.startsWith('/discadia/')) {
+    try {
+      pathKey = decodeURIComponent(url.pathname.slice('/discadia/'.length)).replace(/\/$/, '');
+    } catch {
+      pathKey = '';
+    }
+  }
+  const auth = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+  return [pathKey, url.searchParams.get('key') ?? '', auth].some((candidate) => candidate && safeEqual(candidate, DISCADIA_WEBHOOK_SECRET));
+}
+
+// Where a Discadia request came from, for the test run. Header values that could hold a secret
+// (Authorization) are never logged, and neither is the URL, which contains the key.
+function describeRequest(req) {
+  const h = req.headers;
+  const ip = String(h['x-forwarded-for'] ?? h['x-real-ip'] ?? req.socket.remoteAddress ?? '?').split(',')[0].trim();
+  const val = (k) => (h[k] ? `"${String(h[k]).slice(0, 80)}"` : '-');
+  return (
+    `from ${ip} · user-agent ${val('user-agent')} · origin ${val('origin')} · referer ${val('referer')} · content-type ${val('content-type')} · ` +
+    `authorization ${h.authorization ? 'sent' : 'not sent'} · header names: ${Object.keys(h).join(', ')}`
+  );
+}
+
+// Reads either top.gg format. Votes get an ID so top.gg's retries are only paid once.
 function parseVote(body) {
   if (body?.type === 'vote.create') return { id: `v1:${body.data?.id}`, user: body.data?.user?.platform_id, weight: Number(body.data?.weight) || 1 };
   if (body?.type === 'upvote') return { id: `v0:${body.user}:${Math.floor(nowSec() / 600)}`, user: body.user, weight: body.isWeekend ? 2 : 1 };
   if (body?.type === 'webhook.test' || body?.type === 'test') return { test: true, user: body.data?.user?.platform_id ?? body.user };
   return null;
+}
+
+// Pays a vote and thanks the voter by DM.
+async function payVote(uid, weight, { thanks, again }) {
+  const granted = mintTx(uid, Math.floor(VOTE_REWARD * weight * payoutMultiplier()));
+  const notes = [];
+  bumpStat(uid, 'votes', 1, notes);
+  const weekend = weight > 1 ? ' Weekend votes count double!' : '';
+  const user = await client.users.fetch(uid).catch(() => null);
+  await user?.send({ embeds: [embed(withNotes(`${thanks} You got **${fmt(granted)}** ${ORB}.${weekend} ${again}`, notes), '🗳️ Vote reward')] }).catch(() => {});
 }
 
 async function handleVote(body) {
@@ -4088,33 +4131,44 @@ async function handleVote(body) {
   if (vote.test) return console.log(`Vote webhook: test received from top.gg (user ${vote.user ?? 'unknown'}). It works!`);
   if (!/^\d{15,22}$/.test(String(vote.user))) return console.warn('Vote webhook: vote without a valid Discord ID');
   if (q.addVote.run(vote.id, vote.user, vote.weight, nowSec()).changes === 0) return; // a retry of a vote we already paid
-  const granted = mintTx(vote.user, Math.floor(VOTE_REWARD * vote.weight * payoutMultiplier()));
-  const notes = [];
-  bumpStat(vote.user, 'votes', 1, notes);
-  const weekend = vote.weight > 1 ? ' Weekend votes count double!' : '';
-  const user = await client.users.fetch(vote.user).catch(() => null);
-  await user
-    ?.send({ embeds: [embed(withNotes(`Thanks for voting! You got **${fmt(granted)}** ${ORB}.${weekend} You can vote again in 12 hours.`, notes), '🗳️ Vote reward')] })
-    .catch(() => {});
+  await payVote(vote.user, vote.weight, { thanks: 'Thanks for voting!', again: 'You can vote again in 12 hours.' });
+}
+
+async function handleDiscadiaVote(body) {
+  const uid = String(body?.user_id ?? '');
+  if (!/^\d{15,22}$/.test(uid)) return console.warn('Discadia vote: no valid user_id in the payload');
+  // Discadia's own example payload (from its docs) is a test, never a real vote.
+  if (body.server_slug === 'example-server') return console.log('Discadia vote: that was the example payload, so nothing was paid. The webhook works!');
+  if (GUILD_ID && body.guild_id && String(body.guild_id) !== GUILD_ID) return console.warn(`Discadia vote: ignored, it was for a different server (${body.guild_id}).`);
+  const now = nowSec();
+  const last = q.lastDiscadiaVote.get(uid)?.ts;
+  if (last && now - last < DISCADIA_MIN_GAP) return console.warn(`Discadia vote: ignored a second vote from ${uid} within ${DISCADIA_MIN_GAP / 60} min (a duplicate delivery?).`);
+  q.addVote.run(`discadia:${uid}:${now}`, uid, 1, now);
+  await payVote(uid, 1, { thanks: `Thanks for voting for ${body.server_title ?? 'the server'} on Discadia!`, again: "You can vote again when Discadia's cooldown is over." });
+  console.log(`Discadia vote: paid ${uid}`);
 }
 
 async function handleVoteCommand(i) {
   const last = q.lastVote.get(i.user.id)?.ts;
   const reward = Math.floor(VOTE_REWARD * payoutMultiplier());
+  const links = [
+    TOPGG_WEBHOOK_SECRET && `• **top.gg** (every 12 hours, double on weekends): ${voteUrl()}`,
+    DISCADIA_WEBHOOK_SECRET && `• **Discadia** (vote for the server): ${DISCADIA_VOTE_URL}`,
+  ].filter(Boolean);
   const status = last ? `Your last vote: <t:${last}:R> · total votes: **${q.voteCount.get(i.user.id).n}**` : "You haven't voted yet.";
-  const off = TOPGG_WEBHOOK_SECRET ? '' : '\n\n⚠️ Vote rewards aren\'t set up on this bot yet, so votes won\'t pay out.';
-  return i.reply({
-    embeds: [embed(`Vote for the bot on top.gg every 12 hours and get **${fmt(reward)}** ${ORB} per vote (double on weekends).\n\n${voteUrl()}\n\n${status}${off}`, '🗳️ Vote')],
-    flags: EPH,
-  });
+  const text = links.length ? `Vote for us and get **${fmt(reward)}** ${ORB} per vote:\n${links.join('\n')}\n\n${status}` : "Vote rewards aren't set up on this bot yet, so votes won't pay out.";
+  return i.reply({ embeds: [embed(text, '🗳️ Vote')], flags: EPH });
 }
 
-// A small web server for top.gg's vote webhook (POST /topgg). GET returns "ok" as a health check.
+// A small web server for the vote webhooks: POST /topgg and POST /discadia?key=... GET returns "ok" as a health check.
 function startWebServer() {
-  if (!TOPGG_WEBHOOK_SECRET) return console.log('Vote rewards: off (set TOPGG_WEBHOOK_SECRET to turn them on)');
+  if (!TOPGG_WEBHOOK_SECRET && !DISCADIA_WEBHOOK_SECRET) return console.log('Vote rewards: off (set TOPGG_WEBHOOK_SECRET and/or DISCADIA_WEBHOOK_SECRET to turn them on)');
+  let rejectedLog = { hour: 0, n: 0 }; // keeps rejected-request logging from being used to flood the logs
   const server = http.createServer((req, res) => {
     if (req.method === 'GET') return res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
-    if (req.method !== 'POST' || req.url.split('?')[0] !== '/topgg') return res.writeHead(404).end();
+    const url = new URL(req.url, 'http://localhost');
+    const site = url.pathname === '/topgg' && TOPGG_WEBHOOK_SECRET ? 'topgg' : (url.pathname === '/discadia' || url.pathname.startsWith('/discadia/')) && DISCADIA_WEBHOOK_SECRET ? 'discadia' : null;
+    if (req.method !== 'POST' || !site) return res.writeHead(404).end();
     let raw = '';
     req.setEncoding('utf8');
     req.on('data', (chunk) => {
@@ -4126,8 +4180,16 @@ function startWebServer() {
     });
     req.on('end', () => {
       if (res.writableEnded) return;
-      if (!verifyTopgg(req.headers, raw)) {
-        console.warn('Vote webhook: rejected a request that wasn\'t signed by top.gg');
+      if (!(site === 'topgg' ? verifyTopgg(req.headers, raw) : verifyDiscadia(req, url))) {
+        const hour = Math.floor(Date.now() / 3_600_000);
+        if (rejectedLog.hour !== hour) rejectedLog = { hour, n: 0 };
+        if (rejectedLog.n++ < 20) {
+          console.warn(
+            site === 'topgg'
+              ? "Vote webhook: rejected a request that wasn't signed by top.gg"
+              : `Discadia webhook: rejected a request without the right key ${describeRequest(req)} · body: ${raw.slice(0, 300)}`
+          );
+        }
         return res.writeHead(401).end();
       }
       let body;
@@ -4136,12 +4198,17 @@ function startWebServer() {
       } catch {
         return res.writeHead(400).end();
       }
-      res.writeHead(200).end('ok'); // answer right away; top.gg gives up after 5 seconds
-      handleVote(body).catch((err) => console.error('Vote reward failed:', err));
+      res.writeHead(200).end('ok'); // answer right away; the sites give up after a few seconds
+      if (site === 'discadia') {
+        console.log(`Discadia webhook: received ${describeRequest(req)} · body: ${raw.slice(0, 300)}`);
+        handleDiscadiaVote(body).catch((err) => console.error('Discadia vote reward failed:', err));
+      } else {
+        handleVote(body).catch((err) => console.error('Vote reward failed:', err));
+      }
     });
   });
   server.on('error', (err) => console.error(`Vote rewards: web server failed (${err.message})`));
-  server.listen(WEB_PORT, () => console.log(`Vote rewards: on, listening on port ${WEB_PORT} at /topgg`));
+  server.listen(WEB_PORT, () => console.log(`Vote rewards: on, listening on port ${WEB_PORT} (${[TOPGG_WEBHOOK_SECRET && '/topgg', DISCADIA_WEBHOOK_SECRET && '/discadia'].filter(Boolean).join(', ')})`));
 }
 
 /* ───────────── Moderator tools ───────────── */
@@ -4286,6 +4353,7 @@ function configText() {
     `ENGINEER_ROLE_ID: ${id(env.ENGINEER_ROLE_ID, 'role')}`,
     `ADMIN_PRICE: ${val(env.ADMIN_PRICE)}`,
     `ORB_EMOJI: ${env.ORB_EMOJI ? ORB : `default ${ORB}`}`,
+    `TOPGG_WEBHOOK_SECRET: ${secret(env.TOPGG_WEBHOOK_SECRET)} · DISCADIA_WEBHOOK_SECRET: ${secret(env.DISCADIA_WEBHOOK_SECRET)}`,
     `GITHUB_TOKEN: ${secret(env.GITHUB_TOKEN)} · CHANGELOG_REPO: ${val(CHANGELOG_REPO)}`,
     `DEBUG_DISCORD: ${val(env.DEBUG_DISCORD)}`,
   ].join('\n');
