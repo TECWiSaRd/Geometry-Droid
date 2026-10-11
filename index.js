@@ -4163,12 +4163,27 @@ async function handleVoteCommand(i) {
 // A small web server for the vote webhooks: POST /topgg and POST /discadia?key=... GET returns "ok" as a health check.
 function startWebServer() {
   if (!TOPGG_WEBHOOK_SECRET && !DISCADIA_WEBHOOK_SECRET) return console.log('Vote rewards: off (set TOPGG_WEBHOOK_SECRET and/or DISCADIA_WEBHOOK_SECRET to turn them on)');
-  let rejectedLog = { hour: 0, n: 0 }; // keeps rejected-request logging from being used to flood the logs
+  // Logging of odd requests is capped per hour so it can't be used to flood the logs.
+  let logBudget = { hour: 0, n: 0 };
+  const mayLog = () => {
+    const hour = Math.floor(Date.now() / 3_600_000);
+    if (logBudget.hour !== hour) logBudget = { hour, n: 0 };
+    return logBudget.n++ < 20;
+  };
+  // Only the first part of the path is logged, because a mistyped path can contain the secret.
+  const firstSegment = (pathname) => `/${pathname.split('/')[1] ?? ''}`;
   const server = http.createServer((req, res) => {
-    if (req.method === 'GET') return res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
     const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'GET') {
+      // The plain health check stays quiet; a GET aimed at a webhook path may be a probe from the site.
+      if (/^\/(discadia|topgg)/.test(url.pathname) && mayLog()) console.warn(`Web server: GET ${firstSegment(url.pathname)} (a probe?) ${describeRequest(req)}`);
+      return res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+    }
     const site = url.pathname === '/topgg' && TOPGG_WEBHOOK_SECRET ? 'topgg' : (url.pathname === '/discadia' || url.pathname.startsWith('/discadia/')) && DISCADIA_WEBHOOK_SECRET ? 'discadia' : null;
-    if (req.method !== 'POST' || !site) return res.writeHead(404).end();
+    if (req.method !== 'POST' || !site) {
+      if (mayLog()) console.warn(`Web server: ${req.method} ${firstSegment(url.pathname)} matched nothing, answered 404 ${describeRequest(req)}`);
+      return res.writeHead(404).end();
+    }
     let raw = '';
     req.setEncoding('utf8');
     req.on('data', (chunk) => {
@@ -4181,9 +4196,7 @@ function startWebServer() {
     req.on('end', () => {
       if (res.writableEnded) return;
       if (!(site === 'topgg' ? verifyTopgg(req.headers, raw) : verifyDiscadia(req, url))) {
-        const hour = Math.floor(Date.now() / 3_600_000);
-        if (rejectedLog.hour !== hour) rejectedLog = { hour, n: 0 };
-        if (rejectedLog.n++ < 20) {
+        if (mayLog()) {
           console.warn(
             site === 'topgg'
               ? "Vote webhook: rejected a request that wasn't signed by top.gg"
