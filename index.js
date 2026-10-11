@@ -99,6 +99,8 @@ const VOTE_REWARD = 2_500; // base per vote (weekend votes count as 2); scales w
 // Discadia server votes arrive at /discadia/<DISCADIA_WEBHOOK_SECRET> (or /discadia?key=<secret>). Its webhook has
 // no secret field and its payload has no signature, so a secret you make up, placed in the URL, proves a request is real.
 const DISCADIA_WEBHOOK_SECRET = process.env.DISCADIA_WEBHOOK_SECRET;
+// Optional extra check: only accept Discadia votes sent from these IPs (comma-separated). Off when empty.
+const DISCADIA_ALLOWED_IPS = (process.env.DISCADIA_ALLOWED_IPS ?? '').split(',').map((ip) => ip.trim().replace(/^::ffff:/i, '')).filter(Boolean);
 const DISCADIA_VOTE_URL = process.env.DISCADIA_VOTE_URL || 'https://discadia.com/vote/calxgd/';
 const DISCADIA_MIN_GAP = 60 * 60; // the payload has no vote ID, so a second vote from one member inside this window counts as a duplicate
 const DROP_BASE = 1000;
@@ -4095,14 +4097,35 @@ function verifyDiscadia(req, url) {
   return [pathKey, url.searchParams.get('key') ?? '', auth].some((candidate) => candidate && safeEqual(candidate, DISCADIA_WEBHOOK_SECRET));
 }
 
+// Who really sent a request. Railway's proxy adds the visitor's IP at the END of X-Forwarded-For, while anything
+// a sender puts at the start is unverified, so take the rightmost address that isn't an internal hop (Railway's
+// hops are private addresses, 100.x among them). Headers are only trusted when the direct peer is internal too.
+const normalizeIp = (ip) => String(ip ?? '').trim().replace(/^::ffff:/i, '');
+function isInternalIp(raw) {
+  const ip = normalizeIp(raw);
+  if (!ip) return true;
+  if (ip === '::1' || /^fe80:/i.test(ip) || /^f[cd][0-9a-f]{2}:/i.test(ip)) return true; // IPv6 loopback, link-local, private
+  const m = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(ip);
+  if (!m) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  return a === 127 || a === 10 || a === 100 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+function clientIp(req) {
+  const peer = normalizeIp(req.socket.remoteAddress);
+  if (!isInternalIp(peer)) return peer; // not behind a proxy, so the headers mean nothing
+  const chain = String(req.headers['x-forwarded-for'] ?? '').split(',').map(normalizeIp).filter(Boolean);
+  for (let n = chain.length - 1; n >= 0; n--) if (!isInternalIp(chain[n])) return chain[n];
+  return peer;
+}
+
 // Where a Discadia request came from, for the test run. Header values that could hold a secret
 // (Authorization) are never logged, and neither is the URL, which contains the key.
 function describeRequest(req) {
   const h = req.headers;
-  const ip = String(h['x-forwarded-for'] ?? h['x-real-ip'] ?? req.socket.remoteAddress ?? '?').split(',')[0].trim();
+  const ip = clientIp(req);
   const val = (k) => (h[k] ? `"${String(h[k]).slice(0, 80)}"` : '-');
   return (
-    `from ${ip} · user-agent ${val('user-agent')} · origin ${val('origin')} · referer ${val('referer')} · content-type ${val('content-type')} · ` +
+    `from ${ip} (x-forwarded-for ${val('x-forwarded-for')}) · user-agent ${val('user-agent')} · origin ${val('origin')} · referer ${val('referer')} · content-type ${val('content-type')} · ` +
     `authorization ${h.authorization ? 'sent' : 'not sent'} · header names: ${Object.keys(h).join(', ')}`
   );
 }
@@ -4205,6 +4228,10 @@ function startWebServer() {
         }
         return res.writeHead(401).end();
       }
+      if (site === 'discadia' && DISCADIA_ALLOWED_IPS.length && !DISCADIA_ALLOWED_IPS.includes(clientIp(req))) {
+        if (mayLog()) console.warn(`Discadia webhook: rejected, the sender isn't in DISCADIA_ALLOWED_IPS ${describeRequest(req)} · body: ${raw.slice(0, 300)}`);
+        return res.writeHead(403).end();
+      }
       let body;
       try {
         body = JSON.parse(raw);
@@ -4221,7 +4248,12 @@ function startWebServer() {
     });
   });
   server.on('error', (err) => console.error(`Vote rewards: web server failed (${err.message})`));
-  server.listen(WEB_PORT, () => console.log(`Vote rewards: on, listening on port ${WEB_PORT} (${[TOPGG_WEBHOOK_SECRET && '/topgg', DISCADIA_WEBHOOK_SECRET && '/discadia'].filter(Boolean).join(', ')})`));
+  server.listen(WEB_PORT, () =>
+    console.log(
+      `Vote rewards: on, listening on port ${WEB_PORT} (${[TOPGG_WEBHOOK_SECRET && '/topgg', DISCADIA_WEBHOOK_SECRET && '/discadia'].filter(Boolean).join(', ')})` +
+        (DISCADIA_ALLOWED_IPS.length ? ` · Discadia IP allowlist: ${DISCADIA_ALLOWED_IPS.join(', ')}` : '')
+    )
+  );
 }
 
 /* ───────────── Moderator tools ───────────── */
@@ -4367,6 +4399,7 @@ function configText() {
     `ADMIN_PRICE: ${val(env.ADMIN_PRICE)}`,
     `ORB_EMOJI: ${env.ORB_EMOJI ? ORB : `default ${ORB}`}`,
     `TOPGG_WEBHOOK_SECRET: ${secret(env.TOPGG_WEBHOOK_SECRET)} · DISCADIA_WEBHOOK_SECRET: ${secret(env.DISCADIA_WEBHOOK_SECRET)}`,
+    `DISCADIA_ALLOWED_IPS: ${val(env.DISCADIA_ALLOWED_IPS)}`,
     `GITHUB_TOKEN: ${secret(env.GITHUB_TOKEN)} · CHANGELOG_REPO: ${val(CHANGELOG_REPO)}`,
     `DEBUG_DISCORD: ${val(env.DEBUG_DISCORD)}`,
   ].join('\n');

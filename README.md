@@ -74,6 +74,7 @@ SALARY_INTERVAL_MINUTES=60
 # TOPGG_WEBHOOK_SECRET=whs_...        turns on top.gg vote rewards (see below)
 # DISCADIA_WEBHOOK_SECRET=long-random-text   turns on Discadia vote rewards (see below)
 # DISCADIA_VOTE_URL=https://discadia.com/vote/your-slug/   optional; the link /vote shows (default: calxgd)
+# DISCADIA_ALLOWED_IPS=1.2.3.4       optional; only accept Discadia votes from these IPs
 ```
 
 The bot needs View Channel, Send Messages, Embed Links and Attach Files in the drop, event and review channels.
@@ -95,6 +96,8 @@ Discadia's webhook only takes a URL (no secret field), and its payload (`user_id
 1. Make up a long random secret, for example by running `openssl rand -hex 24`, and put it in the Railway variable `DISCADIA_WEBHOOK_SECRET`. Redeploy.
 2. In your Discadia server's settings, set the webhook URL to `https://<your-railway-domain>/discadia/<that secret>` (the same domain as the top.gg webhook). `https://<your-railway-domain>/discadia?key=<that secret>` works too, but the path form is safer if a form mangles query strings. Anyone who learns the full URL can send fake votes, so keep it private and change the secret if it leaks.
 3. Run a test vote. The Railway log shows `Discadia webhook: received from <ip> · user-agent … · header names: …`. Requests with the wrong key are logged the same way (without the key) and answered with 401, which shows where Discadia's requests really come from.
+
+Optional second check: set `DISCADIA_ALLOWED_IPS` (comma-separated) to only accept votes sent from those IPs; others get a 403. Do this after a real vote has shown Discadia's IP in the log (`Discadia webhook: received from <ip> (x-forwarded-for …)`). The bot takes the rightmost address in `X-Forwarded-For` that isn't an internal hop, because that's the one Railway's proxy adds; anything a sender puts first is ignored. If Discadia ever changes its IP, votes are refused and the log says why, so update the variable. The secret in the URL stays the main protection.
 
 A request is paid only if the key is right, the `user_id` is a Discord ID, the `guild_id` matches `GUILD_ID` (if set), and that member didn't already get a Discadia vote in the last hour (there is no vote ID to tell retries apart, so the hour is the duplicate window; `DISCADIA_MIN_GAP` in `index.js`). Discadia's own example payload (`example-server`) is logged but never paid. The secret may also be sent as an `Authorization` header instead.
 
